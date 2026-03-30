@@ -30,16 +30,13 @@ class AutoDriveBackbone(torch.nn.Module):
             C3K2(width[4], width[4], depth[1], csp[1], r=2)
         )
 
-        # p5/32 stem  —  64×32 → 32×16
+        # p5/32 — same layout as AutoSpeedBackbone p5: stem + block + SPPF + C2PSA
         self.p5 = nn.Sequential(
             Conv(width[4], width[5], activation=nn.SiLU(), k=3, s=2, p=1),
-            C3K2(width[5], width[5], depth[1], csp[1], r=2)
+            C3K2(width[5], width[5], depth[1], csp[1], r=2),
+            SPPF(width[5], width[5]),
+            C2PSA(width[5], width[5])
         )
-
-        # SPPF and C2PSA are kept separate so both outputs are accessible
-        # for the detect head (both feed into Detect per architecture)
-        self.sppf = SPPF(width[5], width[5])
-        self.c2psa = C2PSA(width[5], width[5])
 
     def forward(self, x):
         p1 = self.p1(x)
@@ -47,10 +44,5 @@ class AutoDriveBackbone(torch.nn.Module):
         p3 = self.p3(p2)
         p4 = self.p4(p3)
         p5 = self.p5(p4)
-
-        sppf_out = self.sppf(p5)
-        c2psa_out = self.c2psa(sppf_out)
-
-        # Both tensors: shape  [B, width[5], H/32, W/32]
-        # e.g. with 512×1024 input → [B, width[5], 16, 32]
-        return sppf_out, c2psa_out
+        # [B, width[5], H/32, W/32]  e.g. 512×1024 → 16×32
+        return p5
