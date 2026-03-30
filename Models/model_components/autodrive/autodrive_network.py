@@ -37,9 +37,9 @@ class AutoDrive(nn.Module):
         # self.head = AutoDriveHead(...)  — to be wired once head is designed
 
     def forward(self, x):
-        sppf_out, c2psa_out = self.backbone(x)
-        # return self.head(sppf_out, c2psa_out)  — uncomment once head is ready
-        return sppf_out, c2psa_out
+        p5 = self.backbone(x)
+        # return self.head(p5)  — uncomment once head is ready
+        return p5
 
     def fuse(self):
         for m in self.modules():
