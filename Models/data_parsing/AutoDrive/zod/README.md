@@ -16,6 +16,7 @@ You need a `--zod-root` directory that contains (at minimum):
 - `infos/sequences/{seq}/calibration.json`
 - `vehicle_data/sequences/{seq}/vehicle_data.hdf5`
 - `associations/{seq}_associations.json` (only required if you skip `step1`)
+- `models/autodrive.pt` — AutoSpeed weights for `run_cipo_radar` / debug viz (or pass `--model-path`)
 
 The scripts automatically handle the “3 image segment” layout via `zod_utils.get_images_blur_dir()`.
 
@@ -37,28 +38,29 @@ python run_full_pipeline.py \
   --zod-root /path/to/zod
 ```
 
-Outputs (under `Models/data_parsing/AutoDrive/zod/output/{seq}/` by default):
+All generated data is written under **`--zod-root`** (not next to these scripts):
 
-- `cipo_radar.json`
-- `debug_viz/*.png` (unless `--skip-viz`)
-- `debug_labels/*.png` (unless `--skip-debug-labels`)
+- `{zod_root}/associations/{seq}_associations.json` (step 1)
+- `{zod_root}/output/{seq}/cipo_radar.json`
+- `{zod_root}/output/{seq}/debug_viz/*.png` (unless `--skip-viz`)
+- `{zod_root}/output/{seq}/debug_labels/*.png` (unless `--skip-debug-labels`)
+- `{zod_root}/labels/{seq}/*.json` (merged training labels)
 
-Also generated:
+Use `--output-base` on `run_full_pipeline.py` to change the parent of per-sequence folders (default: `{zod_root}/output`).
 
-- `zod/labels/{seq}/*.json`
-
-Step 1 (`step1_timestamp_association.py`) is included under this folder, so you only need to provide `--zod-root` (the dataset root).
+Step 1 (`step1_timestamp_association.py`) lives in this folder; you only need `--zod-root` pointing at the dataset.
 
 ## 2) Run only association + CIPO-radar for one sequence
 
 ```bash
 python run_cipo_radar.py \
   --sequence 000490 \
-  --zod-root /path/to/zod \
-  --output ./output/000490/cipo_radar.json
+  --zod-root /path/to/zod
 ```
 
-Note: `run_cipo_radar.py` expects `zod/associations/{seq}_associations.json` produced by `step1_timestamp_association.py`.
+Default output: `{zod_root}/output/{seq}/cipo_radar.json`. Pass `--output` to override.
+
+Note: `run_cipo_radar.py` expects `{zod_root}/associations/{seq}_associations.json` from `step1_timestamp_association.py`.
 
 ## 3) Debug visualizations
 
@@ -73,7 +75,7 @@ python debug_cipo_radar_viz.py \
 
 Optional:
 
-- `--model-path /path/to/autodrive.pt`
+- `--model-path /path/to/autodrive.pt` (default: `{zod_root}/models/autodrive.pt` — place the checkpoint next to your dataset)
 
 ### Label sanity check (no inference)
 
@@ -86,8 +88,8 @@ python debug_labels_viz.py \
 
 This reads:
 
-- `zod/labels/{seq}/*.json`
-- `output/{seq}/cipo_radar.json` (or `--cipo-radar` if provided)
+- `{zod_root}/labels/{seq}/*.json`
+- `{zod_root}/output/{seq}/cipo_radar.json` (or `--cipo-radar` if provided)
 
 ## 4) Run over a sequence range / all sequences
 
