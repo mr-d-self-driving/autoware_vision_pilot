@@ -5,7 +5,7 @@ This folder contains scripts to:
 1. Associate ZOD camera images with radar + vehicle control timestamps.
 2. Run a camera-to-radar CIPO (Closest In-Path Object) association (clustering + temporal tracking).
 3. Generate per-image JSON labels for training.
-4. Provide optional debug visualizations (camera overlays + radar BEV).
+4. Optionally render a **single 2×2 debug PNG** per frame (raw radar, labels BEV, labels camera, CIPO camera+BEV).
 
 ## Required inputs
 
@@ -16,7 +16,9 @@ You need a `--zod-root` directory that contains (at minimum):
 - `infos/sequences/{seq}/calibration.json`
 - `vehicle_data/sequences/{seq}/vehicle_data.hdf5`
 - `associations/{seq}_associations.json` (only required if you skip `step1`)
-- `models/autodrive.pt` — AutoSpeed weights for `run_cipo_radar` / debug viz (or pass `--model-path`)
+- `models/autospeed.pt` — AutoSpeed weights for `run_cipo_radar` / `debug_zod_grid.py` (or `--model-path`)
+
+Use **conda `base`** (or the same environment for the whole pipeline) and install deps, e.g. `pip install h5py scikit-learn` plus `torch` / `Pillow` as needed (`Models/requirements.txt` includes `h5py`).
 
 The scripts automatically handle the “3 image segment” layout via `zod_utils.get_images_blur_dir()`.
 
@@ -42,8 +44,7 @@ All generated data is written under **`--zod-root`** (not next to these scripts)
 
 - `{zod_root}/associations/{seq}_associations.json` (step 1)
 - `{zod_root}/output/{seq}/cipo_radar.json`
-- `{zod_root}/output/{seq}/debug_viz/*.png` (unless `--skip-viz`)
-- `{zod_root}/output/{seq}/debug_labels/*.png` (unless `--skip-debug-labels`)
+- `{zod_root}/output/{seq}/debug/images/grid_*.png` (unless `--skip-viz`)
 - `{zod_root}/labels/{seq}/*.json` (merged training labels)
 
 Use `--output-base` on `run_full_pipeline.py` to change the parent of per-sequence folders (default: `{zod_root}/output`).
@@ -62,34 +63,26 @@ Default output: `{zod_root}/output/{seq}/cipo_radar.json`. Pass `--output` to ov
 
 Note: `run_cipo_radar.py` expects `{zod_root}/associations/{seq}_associations.json` from `step1_timestamp_association.py`.
 
-## 3) Debug visualizations
+Temporal logic (see `TEMPORAL_NEIGHBOR_FRAMES = 10` in `run_cipo_radar.py`): Pass 1 can only propagate from **past** frames when a CIPO bbox exists but radar matching fails. Pass 2 (CIPO + bbox, no range) and Pass 3 (no CIPO camera, path + moving radar) each search **up to 10 frames forward and 10 backward** for consistent distance/speed.
 
-### Camera + CIPO-radar BEV overlay
+## 3) 2×2 debug grid (optional)
 
-```bash
-python debug_cipo_radar_viz.py \
-  --sequence 000490 \
-  --zod-root /path/to/zod \
-  --every 10
-```
+After labels exist, `run_full_pipeline.py` runs `debug_zod_grid.py`, which writes one large image per sampled frame:
 
-Optional:
-
-- `--model-path /path/to/autodrive.pt` (default: `{zod_root}/models/autodrive.pt` — place the checkpoint next to your dataset)
-
-### Label sanity check (no inference)
+| TL | TR |
+|----|-----|
+| Raw radar BEV (all points, 0–150 m) | Labels BEV (GT dot, path, cyan CIPO) |
+| BL | BR |
+| Labels camera (overlays) | CIPO: AutoSpeed camera (top) + association BEV (bottom) |
 
 ```bash
-python debug_labels_viz.py \
+python debug_zod_grid.py \
   --sequence 000490 \
   --zod-root /path/to/zod \
-  --n 20
+  --every 20
 ```
 
-This reads:
-
-- `{zod_root}/labels/{seq}/*.json`
-- `{zod_root}/output/{seq}/cipo_radar.json` (or `--cipo-radar` if provided)
+Defaults: `--output-dir {zod_root}/output/{seq}/debug/images`, `--model-path {zod_root}/models/autospeed.pt`. Requires `{zod_root}/labels/{seq}/` and `cipo_radar.json`.
 
 ## 4) Run over a sequence range / all sequences
 

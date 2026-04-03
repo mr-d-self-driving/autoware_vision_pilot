@@ -39,11 +39,11 @@ def iter_all_sequences():
 def sequence_output_dir(zod_root: Path, seq: str) -> Path:
     """
     Per-sequence pipeline outputs live under the dataset root:
-    {zod_root}/output/{seq}/  (cipo_radar.json, debug_viz/, debug_labels/, model_input_sample.png, …)
+    {zod_root}/output/{seq}/  (cipo_radar.json, debug/images/, model_input_sample.png, …)
     """
     return Path(zod_root) / "output" / seq
 
 
 def default_autospeed_checkpoint(zod_root: Path) -> Path:
-    """AutoSpeed weights next to the dataset: {zod_root}/models/autodrive.pt"""
-    return Path(zod_root) / "models" / "autodrive.pt"
+    """AutoSpeed weights next to the dataset: {zod_root}/models/autospeed.pt"""
+    return Path(zod_root) / "models" / "autospeed.pt"

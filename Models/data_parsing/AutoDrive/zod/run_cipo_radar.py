@@ -35,6 +35,12 @@ _MIN_ABS_SPEED_WORLD_MS = 0.5   # Scenario 3: |range_rate + ego_speed| > 0.5 →
 _MIN_ABS_RANGE_RATE_FALLBACK = 0.5  # fallback when ego_speed not available
 _MAX_RANGE_M = 200.0        # maximum radar search range (m) - radar useful up to ~200m
 
+# Temporal association: search up to N frames forward/back.
+# - Pass 1 (CIPO, cluster miss): track_from_prev only looks *backward* in `results` (online; future frames not built yet).
+# - Pass 2 (CIPO bbox, no range): lookahead + lookbehind N for same-object D/V extrapolation.
+# - Pass 3 (no CIPO camera): lookahead + lookbehind N for path-radar neighbor fill (moving target).
+TEMPORAL_NEIGHBOR_FRAMES = 10
+
 # Volvo XC90 (ZOD vehicle) steering geometry - same as step1_timestamp_association.py
 _STEERING_COLUMN_RATIO = 16.8  # steering wheel deg / tyre deg
 
@@ -408,7 +414,7 @@ def main():
         "--model-path",
         type=str,
         default=None,
-        help="Path to AutoSpeed weights (default: {zod_root}/models/autodrive.pt)",
+        help="Path to AutoSpeed weights (default: {zod_root}/models/autospeed.pt)",
     )
     args = parser.parse_args()
     seq = args.sequence
@@ -553,12 +559,11 @@ def main():
         track_from_prev = False
 
         if cluster is None:
-            # 1. First: Track from previous frames (temporal continuity)
-            TRACK_LOOKBEHIND = 10
+            # 1. Track from previous frames only (same pass; future frames not in `results` yet).
             AZ_TOL_DEG = 4.0
             MAX_GAP_S = 1.0
             best_D, best_V, best_gap = None, None, float("inf")
-            for k in range(1, min(TRACK_LOOKBEHIND + 1, len(results) + 1)):
+            for k in range(1, min(TEMPORAL_NEIGHBOR_FRAMES + 1, len(results) + 1)):
                 rj = results[-k]
                 if rj.get("distance_m") is None:
                     continue
@@ -631,9 +636,9 @@ def main():
             })
 
     print(f"  Pass 1 done: {len(results)} frames. Running backfill...", flush=True)
-    # Pass 2: backfill - look ahead AND behind for cluster, estimate if same object
-    LOOKAHEAD = 10
-    LOOKBEHIND = 10
+    # Pass 2: CIPO frames with bbox but no radar match — look ahead AND behind TEMPORAL_NEIGHBOR_FRAMES
+    LOOKAHEAD = TEMPORAL_NEIGHBOR_FRAMES
+    LOOKBEHIND = TEMPORAL_NEIGHBOR_FRAMES
     AZ_TOL_DEG = 4.0  # same object: azimuth within 4 deg
     MAX_GAP_S = 1.0   # max time gap (seconds)
 
@@ -706,9 +711,9 @@ def main():
             r["bev_xy"] = viz.get("bev_xy")
             r["speed_ms_adjusted"] = viz.get("speed_ms_adjusted")
 
-    # Pass 3: no-CIPO temporal fill - forward+backward, search by (D,V), iterative
-    NO_CIPO_LOOKAHEAD = 10
-    NO_CIPO_LOOKBEHIND = 10
+    # Pass 3: no-CIPO — path/radar association via neighbors ±TEMPORAL_NEIGHBOR_FRAMES (iterative)
+    NO_CIPO_LOOKAHEAD = TEMPORAL_NEIGHBOR_FRAMES
+    NO_CIPO_LOOKBEHIND = TEMPORAL_NEIGHBOR_FRAMES
     NO_CIPO_MAX_GAP_S = 1.0
     NO_CIPO_RANGE_TOL_M = 3.0
     NO_CIPO_VEL_TOL_MS = 2.0

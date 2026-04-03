@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Full pipeline: step1 associations -> run_cipo_radar (cluster + track) -> labels -> debug viz.
+Full pipeline: step1 -> CIPO-radar -> labels -> 2x2 debug grid (single PNGs).
 
-All artifacts are written under --zod-root (not next to this script):
+All artifacts under --zod-root:
   - {zod_root}/associations/{seq}_associations.json
   - {zod_root}/output/{seq}/cipo_radar.json
   - {zod_root}/labels/{seq}/*.json
-  - {zod_root}/output/{seq}/debug_viz/*.png
-  - {zod_root}/output/{seq}/debug_labels/*.png
+  - {zod_root}/output/{seq}/debug/images/grid_*.png
 
 Override the output parent with --output-base (default: {zod_root}/output).
 """
@@ -35,7 +34,7 @@ def run_step1(seq: str, zod_root: Path) -> bool:
         "--sequence", seq,
         "--zod-root", str(zod_root),
     ]
-    print(f"[1/5] Running step1 associations for {seq}...")
+    print(f"[1/4] Running step1 associations for {seq}...")
     r = subprocess.run(cmd, cwd=str(zod_root))
     return r.returncode == 0
 
@@ -48,7 +47,7 @@ def run_cipo_radar(seq: str, zod_root: Path, output_dir: Path, model_path: Optio
     cmd = [sys.executable, str(script), "--sequence", seq, "--zod-root", str(zod_root), "--output", str(out_path)]
     if model_path:
         cmd.extend(["--model-path", model_path])
-    print(f"[2/5] Running CIPO-radar (cluster + track) for {seq}...")
+    print(f"[2/4] Running CIPO-radar (cluster + track) for {seq}...")
     r = subprocess.run(cmd, cwd=str(REPO_ROOT))
     return r.returncode == 0
 
@@ -70,7 +69,7 @@ def generate_labels(seq: str, zod_root: Path, cipo_radar_path: Path) -> bool:
     # Build image -> full cipo_radar record
     cipo_map = {r["image"]: r for r in cipo["results"]}
 
-    print(f"[3/5] Generating labels for {seq}...")
+    print(f"[3/4] Generating labels for {seq}...")
     n_labels = 0
     for rec in assoc["associations"]:
         img = rec["image"]
@@ -106,46 +105,31 @@ def generate_labels(seq: str, zod_root: Path, cipo_radar_path: Path) -> bool:
     return True
 
 
-def run_debug_labels(seq: str, zod_root: Path, output_dir: Path, cipo_path: Path, n: int = 20) -> bool:
-    """Run debug labels: N random images, bbox + labeled dot in BEV (no inference)."""
-    out_dir = output_dir / "debug_labels"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    script = Path(__file__).parent / "debug_labels_viz.py"
-    cmd = [
-        sys.executable, str(script),
-        "--sequence", seq,
-        "--zod-root", str(zod_root),
-        "--labels-dir", str(zod_root / "labels" / seq),
-        "--cipo-radar", str(cipo_path),
-        "--output-dir", str(out_dir),
-        "--n", str(n),
-    ]
-    print(f"[5/5] Running debug labels for {seq} ({n} random images)...")
-    r = subprocess.run(cmd, cwd=str(REPO_ROOT))
-    return r.returncode == 0
-
-
-def run_debug_viz(
+def run_debug_grid(
     seq: str,
     zod_root: Path,
     output_dir: Path,
+    cipo_path: Path,
     every: int = 20,
     model_path: Optional[str] = None,
 ) -> bool:
-    """Run debug visualization."""
-    viz_dir = output_dir / "debug_viz"
-    viz_dir.mkdir(parents=True, exist_ok=True)
-    script = Path(__file__).parent / "debug_cipo_radar_viz.py"
+    """Single 2x2 debug image per sampled frame -> output_dir/debug/images/."""
+    out_dir = output_dir / "debug" / "images"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    script = Path(__file__).parent / "debug_zod_grid.py"
     cmd = [
-        sys.executable, str(script),
+        sys.executable,
+        str(script),
         "--sequence", seq,
         "--zod-root", str(zod_root),
         "--every", str(every),
-        "--output-dir", str(viz_dir),
+        "--labels-dir", str(zod_root / "labels" / seq),
+        "--cipo-radar", str(cipo_path),
+        "--output-dir", str(out_dir),
     ]
     if model_path:
         cmd.extend(["--model-path", model_path])
-    print(f"[4/5] Running debug viz for {seq} (every {every} frames)...")
+    print(f"[4/4] Running 2x2 debug grid for {seq} (every {every} frames) -> {out_dir}...")
     r = subprocess.run(cmd, cwd=str(REPO_ROOT))
     return r.returncode == 0
 
@@ -156,10 +140,9 @@ def main():
     parser.add_argument("--zod-root", type=str, default=None, required=True, help="Path to the ZOD dataset root (contains associations/, radar_front/, vehicle_data/, images_blur_* folders, etc.)")
     parser.add_argument("--skip-step1", action="store_true", help="Skip step1 if associations exist")
     parser.add_argument("--skip-labels", action="store_true", help="Skip label generation")
-    parser.add_argument("--skip-viz", action="store_true", help="Skip debug viz")
-    parser.add_argument("--skip-debug-labels", action="store_true", help="Skip debug labels (20 random images)")
-    parser.add_argument("--every", type=int, default=20, help="Debug viz: output every N frames")
-    parser.add_argument("--skip-debug", action="store_true", help="Skip both debug viz and debug labels (for --all-sequences)")
+    parser.add_argument("--skip-viz", action="store_true", help="Skip 2x2 debug grid (debug/images/)")
+    parser.add_argument("--every", type=int, default=20, help="Debug grid: process every Nth frame")
+    parser.add_argument("--skip-debug", action="store_true", help="Skip debug grid (for --all-sequences)")
     parser.add_argument(
         "--output-base",
         type=str,
@@ -177,7 +160,7 @@ def main():
         "--model-path",
         type=str,
         default=None,
-        help="AutoSpeed checkpoint for run_cipo_radar / debug viz (default: {zod_root}/models/autodrive.pt)",
+        help="AutoSpeed checkpoint for run_cipo_radar / debug grid (default: {zod_root}/models/autospeed.pt)",
     )
     args = parser.parse_args()
 
@@ -272,7 +255,7 @@ def _run_pipeline_for_seq(seq: str, zod: Path, output_dir: Path, args) -> bool:
             print("Step1 failed")
             return False
     else:
-        print(f"[1/5] Skipping step1 (associations exist)")
+        print(f"[1/4] Skipping step1 (associations exist)")
 
     # Step 2: CIPO-radar
     cipo_path = output_dir / "cipo_radar.json"
@@ -284,26 +267,19 @@ def _run_pipeline_for_seq(seq: str, zod: Path, output_dir: Path, args) -> bool:
     if not args.skip_labels:
         generate_labels(seq, zod, cipo_path)
     else:
-        print("[3/5] Skipping label generation")
+        print("[3/4] Skipping label generation")
 
-    # Step 4: debug viz
-    if not args.skip_viz and not getattr(args, "skip_debug", False):
-        run_debug_viz(seq, zod, output_dir, args.every, model_path=args.model_path)
+    # Step 4: 2x2 debug grid (requires labels)
+    if not args.skip_viz and not args.skip_labels and not getattr(args, "skip_debug", False):
+        run_debug_grid(seq, zod, output_dir, cipo_path, every=args.every, model_path=args.model_path)
     else:
-        print("[4/5] Skipping debug viz")
-
-    # Step 5: debug labels
-    if not args.skip_debug_labels and not args.skip_labels and not getattr(args, "skip_debug", False):
-        run_debug_labels(seq, zod, output_dir, cipo_path, n=20)
-    else:
-        print("[5/5] Skipping debug labels")
+        print("[4/4] Skipping debug grid (use labels + inference)")
 
     print(f"\nDone. Sequence {seq}:")
     print(f"  Associations: {assoc_path}")
     print(f"  Output:      {output_dir}")
-    print(f"    cipo_radar: {cipo_path}")
-    print(f"    debug_viz:     {output_dir / 'debug_viz'}")
-    print(f"    debug_labels:  {output_dir / 'debug_labels'}")
+    print(f"    cipo_radar:  {cipo_path}")
+    print(f"    debug grid:  {output_dir / 'debug' / 'images'}")
     print(f"  Labels:      {zod / 'labels' / seq}")
     return True
 
