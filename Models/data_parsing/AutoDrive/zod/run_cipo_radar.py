@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Run AutoSpeed on ZOD images, compute CIPO azimuth in camera frame,
-transform to radar frame, associate with nearest radar cluster.
+Run AutoSpeed (letterboxed inference, auto_speed_infer.AutoSpeedNetworkInfer) on ZOD images,
+compute CIPO azimuth in camera frame, transform to radar frame, associate with nearest radar cluster.
 Output: distance (m), speed (m/s) per image.
 """
 
@@ -18,17 +18,9 @@ sys.path.insert(0, str(_REPO_ROOT))
 from PIL import Image
 
 try:
-    from Models.inference.auto_speed_infer_50deg import (
-        AutoSpeed50Infer,
-        center_crop_50deg_resize,
-        pixel_to_h_angle_deg_50,
-    )
+    from Models.inference.auto_speed_infer import AutoSpeedNetworkInfer
 except ImportError:
-    from inference.auto_speed_infer_50deg import (
-        AutoSpeed50Infer,
-        center_crop_50deg_resize,
-        pixel_to_h_angle_deg_50,
-    )
+    from inference.auto_speed_infer import AutoSpeedNetworkInfer
 
 try:
     from sklearn.cluster import DBSCAN
@@ -363,12 +355,23 @@ def _pixel_point_from_bbox(bbox):
     return [round(float(u), 1), round(float(v), 1)]
 
 
-def find_cipo_via_bbox(preds, curvature_inv_m, clusters, cam_ext, radar_ext, crop_info,
-                        lat_buffer_m=0.5, path_buffer_m=1.0):
+def find_cipo_via_bbox(
+    preds,
+    curvature_inv_m,
+    clusters,
+    cam_ext,
+    radar_ext,
+    W: float,
+    H: float,
+    hfov_deg: float,
+    lat_buffer_m=0.5,
+    path_buffer_m=1.0,
+):
     """
     Scenario 2: no L1/L2 CIPO detected but other bounding boxes exist.
     For each bbox sorted by bottom-y (closest first), project to radar azimuth,
     find nearest radar cluster, verify it lies on the curvature path.
+    Bbox coords are in full image space (same as inference output).
     Returns (cluster, az_radar_rad) for the first on-path bbox match, or (None, None).
     """
     if not preds or not clusters:
@@ -377,7 +380,7 @@ def find_cipo_via_bbox(preds, curvature_inv_m, clusters, cam_ext, radar_ext, cro
     for pred in sorted_preds:
         x1, y1, x2, y2, conf, cls = pred
         u = (x1 + x2) / 2
-        h_angle_deg = pixel_to_h_angle_deg_50(u, crop_info)
+        h_angle_deg = pixel_to_h_angle_deg(u, W, H, hfov_deg)
         az_radar = cam_dir_to_radar_azimuth(h_angle_deg, cam_ext, radar_ext)
         cluster = find_nearest_cluster_lateral(clusters, az_radar, lat_buffer_m=lat_buffer_m)
         if cluster is None:
@@ -438,7 +441,7 @@ def main():
     radar_ext = np.array(calib["radar_extrinsics"])
 
     radar_data = np.load(assoc["radar_npy_path"], allow_pickle=True)
-    model = AutoSpeed50Infer(str(model_path))
+    model = AutoSpeedNetworkInfer(str(model_path))
 
     out_path = Path(args.output) if args.output else sequence_output_dir(zod, seq) / "cipo_radar.json"
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -460,12 +463,13 @@ def main():
             continue
 
         img = Image.open(img_path).convert("RGB")
-        crop_img, crop_info = center_crop_50deg_resize(img, W, H, hfov_deg)
         sample_path = str(out_path.parent / "model_input_sample.png") if not sample_saved else None
         if sample_path:
             sample_saved = True
-            print(f"Saved model input sample -> {sample_path}")
-        preds = model.inference(crop_img, crop_info, W, H, save_sample_path=sample_path)
+            letterboxed, _, _, _ = model.resize_letterbox(img)
+            letterboxed.save(sample_path)
+            print(f"Saved model input sample (letterboxed 1024x512) -> {sample_path}")
+        preds = model.inference(img)
         if (idx + 1) % 20 == 0 or idx == 0:
             print(f"  CIPO-radar: {idx + 1}/{n_assoc} images", flush=True)
 
@@ -482,7 +486,7 @@ def main():
             if preds:
                 clusters_s2 = get_radar_clusters(radar_data, rec["radar_timestamp_ns"], lat_buffer=_LAT_BUFFER_M)
                 cluster_s2, az_s2 = find_cipo_via_bbox(
-                    preds, curvature, clusters_s2, cam_ext, radar_ext, crop_info,
+                    preds, curvature, clusters_s2, cam_ext, radar_ext, W, H, hfov_deg,
                     lat_buffer_m=_LAT_BUFFER_M, path_buffer_m=_LAT_BUFFER_PATH_M,
                 )
                 if cluster_s2 is not None:
@@ -534,7 +538,7 @@ def main():
         x1, y1, x2, y2, conf, cls = cipo[0]
         u = (x1 + x2) / 2
 
-        h_angle_deg = pixel_to_h_angle_deg_50(u, crop_info)
+        h_angle_deg = pixel_to_h_angle_deg(u, W, H, hfov_deg)
         az_radar = cam_dir_to_radar_azimuth(h_angle_deg, cam_ext, radar_ext)
         az_radar_deg = float(np.rad2deg(az_radar))
 
