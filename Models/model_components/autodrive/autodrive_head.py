@@ -59,9 +59,14 @@ class AutoDriveHead(nn.Module):
             nn.ReLU(),
         )
 
-        self.curvature_head = nn.Linear(512, 1)
-
-        self.flag_head = nn.Linear(512, 2)
+        self.curvature_head = nn.Sequential(
+            nn.Linear(512, 1),
+            nn.Tanh(),
+        )
+        self.flag_head = nn.Sequential(
+            nn.Linear(512, 1),
+            nn.Sigmoid(),
+        )
 
     def forward(self, feature_prev: torch.Tensor, feature_curr: torch.Tensor):
         x = torch.cat([feature_prev, feature_curr], dim=1)
