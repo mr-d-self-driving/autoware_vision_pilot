@@ -11,7 +11,7 @@ from Models.model_components.scene_3d_network import Scene3DNetwork
 from Models.model_components.domain_seg_network import DomainSegNetwork
 from Models.model_components.auto_speed.auto_speed_network import AutoSpeedNetwork
 from Models.model_components.ego_lanes_network import EgoLanesNetwork
-from Models.model_components.auto_steer_network import AutoSteerNetwork
+from Models.model_components.auto_steer.auto_steer_network import AutoSteerNetwork
 def main():
 
     # Argument parser for data root path and save path
@@ -58,7 +58,7 @@ def main():
         model = EgoLanesNetwork()
     elif (model_name == 'AutoSteer'):
         print('Processing AutoSteer Network')
-        model = AutoSteerNetwork()
+        model = AutoSteerNetwork().build_model(version='n')
     else:
         raise Exception("Model name not specified correctly, please check")
 
@@ -84,7 +84,7 @@ def main():
     if model_name == 'AutoSpeed':
         input_shape=(1, 3, 512, 1024)
     elif model_name == 'AutoSteer':
-        input_shape=(1, 6, 80, 160)
+        input_shape=(1, 3, 512, 1024)
     else:
         input_shape=(1, 3, 320, 640)
     input_data = torch.randn(input_shape)

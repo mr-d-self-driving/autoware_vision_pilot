@@ -5,7 +5,7 @@ from Models.model_components.common_layers import (Conv)
 
 
 class AutoSteerPerceptHead(nn.Module):
-    def __init__(self, nc, in_ch):
+    def __init__(self, in_ch):
         super().__init__()
         in_ch2 = int(in_ch /2)
         in_ch4 = int(in_ch /4)

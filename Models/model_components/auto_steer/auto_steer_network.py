@@ -30,11 +30,11 @@ def fuse_conv(conv, norm):
 
 
 class YOLO(torch.nn.Module):
-    def __init__(self, width, depth, csp, num_classes):
+    def __init__(self, width, depth, csp):
         super().__init__()
         self.net = AutoSteerBackbone(width, depth, csp)
         self.fpn = AutoSteerNeck(width, depth, csp)
-        self.head = AutoSteerPerceptHead(num_classes, width[4])
+        self.head = AutoSteerPerceptHead(width[4])
 
     def forward(self, x):
         x = self.net(x)
@@ -61,17 +61,17 @@ class AutoSteerNetwork:
             'x': {'csp': [True, True], 'depth': [2, 2, 2, 2, 2, 2], 'width': [3, 96, 192, 384, 768, 768]},
         }
 
-    def build_model(self, version, num_classes):
+    def build_model(self, version):
         csp = self.dynamic_weighting[version]['csp']
         depth = self.dynamic_weighting[version]['depth']
         width = self.dynamic_weighting[version]['width']
-        return YOLO(width, depth, csp, num_classes)
+        return YOLO(width, depth, csp)
 
     def load_model(self, version, num_classes, checkpoint_path):
         csp = self.dynamic_weighting[version]['csp']
         depth = self.dynamic_weighting[version]['depth']
         width = self.dynamic_weighting[version]['width']
-        model = YOLO(width, depth, csp, num_classes)
+        model = YOLO(width, depth, csp)
 
         ckpt = torch.load(checkpoint_path, weights_only=False)
         loaded_model = ckpt['model']
