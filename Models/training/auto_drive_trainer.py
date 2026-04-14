@@ -1,6 +1,7 @@
 # AutoDrive trainer
 
 import sys
+import math
 from pathlib import Path
 
 import matplotlib
@@ -70,6 +71,10 @@ class AutoDriveTrainer:
     """
 
     _CIPO_POS_WEIGHT = torch.tensor([0.295 / 0.705])  # ≈ 0.418
+    _CURV_LOSS_W = 2.0
+    _DIST_LOSS_W = 2.0
+    _WHEELBASE_M = 2.984
+    _STEERING_COLUMN_RATIO = 16.8
 
     def __init__(self, tensorboard_dir: str = "runs",
                  train_mode: str = TRAIN_MODE_JOINT,
@@ -224,7 +229,11 @@ class AutoDriveTrainer:
             # Flag — always in joint mode
             loss_f = self._bce(flag_logits, self.flag_gt)
 
-        self.loss           = loss_c + loss_d + loss_f
+        self.loss = (
+            self._CURV_LOSS_W * loss_c +
+            self._DIST_LOSS_W * loss_d +
+            loss_f
+        )
         self.loss_curvature = loss_c.item()
         self.loss_distance  = loss_d.item()
         self.loss_flag      = loss_f.item()
@@ -250,7 +259,7 @@ class AutoDriveTrainer:
     # ------------------------------------------------------------------
 
     def validate(self, batch: dict) -> tuple:
-        """Returns (total, dist, curv, flag, flag_acc_pct, dist_mae_m)."""
+        """Returns (total, dist, curv, flag, flag_acc_pct, dist_mae_m, steer_mae_deg)."""
         self.set_batch(batch)
 
         d_pred, curv_pred, flag_logits = self.model(self.img_prev, self.img_curr)
@@ -266,13 +275,25 @@ class AutoDriveTrainer:
             dist_mae_m = 0.0
 
         loss_f = self._bce(flag_logits, self.flag_gt)
-        total  = loss_c + loss_d + loss_f
+        total = (
+            loss_c +
+            loss_d +
+            loss_f
+        )
 
         pred_label = (flag_logits > 0.0).float()
         flag_acc   = (pred_label == self.flag_gt).float().mean().item() * 100.0
 
+        # Curvature (normalised) -> physical (1/m) -> steering wheel angle (deg)
+        curv_pred_m = curv_pred * CURV_SCALE
+        curv_gt_m = self.curvature_gt * CURV_SCALE
+        steer_scale = self._STEERING_COLUMN_RATIO * (180.0 / math.pi)
+        steer_pred_deg = torch.atan(curv_pred_m * self._WHEELBASE_M) * steer_scale
+        steer_gt_deg = torch.atan(curv_gt_m * self._WHEELBASE_M) * steer_scale
+        steer_mae_deg = (steer_pred_deg - steer_gt_deg).abs().mean().item()
+
         return (total.item(), loss_d.item(), loss_c.item(), loss_f.item(),
-                flag_acc, dist_mae_m)
+                flag_acc, dist_mae_m, steer_mae_deg)
 
     # ------------------------------------------------------------------
     # Gradient helpers
@@ -395,34 +416,41 @@ class AutoDriveTrainer:
         self.writer.flush()
 
     def log_val_epoch(self, total: float, dist: float, curv: float, flag: float,
-                      flag_acc: float, dist_mae_m: float, epoch: int):
+                      flag_acc: float, dist_mae_m: float, steer_mae_deg: float, epoch: int):
         self.writer.add_scalar("Loss/val_total",      total,      epoch)
         self.writer.add_scalar("Loss/val_curvature",  curv,       epoch)
         self.writer.add_scalar("Loss/val_distance",   dist,       epoch)
         self.writer.add_scalar("Loss/val_flag",       flag,       epoch)
         self.writer.add_scalar("Metrics/flag_acc_%",  flag_acc,   epoch)
         self.writer.add_scalar("Metrics/dist_mae_m",  dist_mae_m, epoch)
+        self.writer.add_scalar("Metrics/steer_mae_deg", steer_mae_deg, epoch)
         self.writer.flush()
 
     def log_test(self, total: float, dist: float, curv: float, flag: float,
-                 flag_acc: float, dist_mae_m: float):
+                 flag_acc: float, dist_mae_m: float, steer_mae_deg: float):
         self.writer.add_scalar("Loss/test_total",         total,      0)
         self.writer.add_scalar("Loss/test_curvature",     curv,       0)
         self.writer.add_scalar("Loss/test_distance",      dist,       0)
         self.writer.add_scalar("Loss/test_flag",          flag,       0)
         self.writer.add_scalar("Metrics/test_flag_acc_%", flag_acc,   0)
         self.writer.add_scalar("Metrics/test_dist_mae_m", dist_mae_m, 0)
+        self.writer.add_scalar("Metrics/test_steer_mae_deg", steer_mae_deg, 0)
         self.writer.flush()
 
     def log_train_loss(self, step: int):
         self.log_train_step(step)
 
+    def _curvature_to_steer_deg(self, curvature_1_per_m: float) -> float:
+        """Inverse Ackermann: curvature (1/m) -> steering wheel angle (deg)."""
+        tyre_angle_rad = math.atan(curvature_1_per_m * self._WHEELBASE_M)
+        return math.degrees(tyre_angle_rad * self._STEERING_COLUMN_RATIO)
+
     # ------------------------------------------------------------------
     # Visualization
     # ------------------------------------------------------------------
 
-    def save_visualization(self, step: int):
-        """Write an annotated sample image to TensorBoard."""
+    def save_visualization(self, step: int, split: str = "train"):
+        """Write an annotated sample image to TensorBoard for train/val."""
         if self._img_prev_vis is None:
             return
 
@@ -445,9 +473,12 @@ class AutoDriveTrainer:
         # Overlay text — curvature displayed in physical units (1/m)
         curv_pred_m = self._curv_pred_val * CURV_SCALE
         curv_gt_m   = self._curv_gt_val   * CURV_SCALE
+        steer_pred_deg = self._curvature_to_steer_deg(curv_pred_m)
+        steer_gt_deg   = self._curvature_to_steer_deg(curv_gt_m)
         txt_lines = [
             f"dist pred : {d_pred_m:6.1f} m   GT: {d_gt_m:6.1f} m",
             f"curv pred : {curv_pred_m:+.5f} 1/m  GT: {curv_gt_m:+.5f} 1/m",
+            f"steer pred: {steer_pred_deg:+6.1f} deg  GT: {steer_gt_deg:+6.1f} deg",
             f"flag prob : {self._flag_pred_val:.3f}        GT: {int(self._flag_gt_val)}",
         ]
         ax_img.text(
@@ -485,7 +516,8 @@ class AutoDriveTrainer:
         ax_bar.set_title("Pred vs GT", color="white", fontsize=9)
 
         plt.tight_layout()
-        self.writer.add_figure("Visualization/sample", fig, global_step=step)
+        tag = "Visualization/val_sample" if split == "val" else "Visualization/sample"
+        self.writer.add_figure(tag, fig, global_step=step)
         plt.close(fig)
 
     def cleanup(self):
