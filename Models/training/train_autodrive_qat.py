@@ -1,12 +1,22 @@
 """
 Quantization-Aware Training (QAT) for AutoDrive — PyTorch 2 Export / XNNPACK flow.
 
-After every epoch this script produces:
-  1. QAT prepared checkpoint  — fake-quantize model, still float weights, resumable
-  2. Converted INT8 checkpoint — convert_pt2e output, ready for INT8 ONNX export
+Why convert_pt2e is called ONLY at the end
+──────────────────────────────────────────
+Calling convert_pt2e mid-training gives misleading, degraded results. While the
+fake-quantize nodes are still calibrating and weights are still changing, the
+converted INT8 model is essentially a half-trained snapshot.  The flag head (BCE
+loss) is particularly sensitive — logit precision errors under INT8 rounding push
+binary classification accuracy to near-random levels even when the float model is
+learning well.
 
-Both are validated every epoch so TensorBoard shows the quantization gap live.
-The best INT8 model (by val loss) is kept separately.
+The correct flow (matching the PyTorch PT2E tutorial) is:
+  1. Train the prepared model to convergence — observers calibrate throughout.
+  2. Save the best prepared checkpoint each epoch (fake-quantize, float weights).
+  3. Call convert_pt2e ONCE at the very end on the best-trained checkpoint.
+
+The resulting converted model is then used to export INT8 ONNX via the standard
+convert_pytorch_to_onnx.py script.
 
 Dependencies (install once):
   pip install torchao executorch
@@ -19,36 +29,26 @@ Usage
       --checkpoint ~/data/zod/training/autodrive/run002/checkpoints/AutoDrive_best.pth \\
       --epochs 10 \\
       --batch-size 8 \\
-      --workers 2 \\
-      --export-onnx
+      --workers 2
 
 ──────────────────────────────────────────────────────────────────
 Outputs  →  {root}/training/autodrive_qat/{run_name}/
 ──────────────────────────────────────────────────────────────────
   checkpoints/
-    AutoDrive_qat_last.pth              QAT prepared   (latest epoch, resumable)
-    AutoDrive_qat_best.pth              QAT prepared   (best val — prepared model)
-    AutoDrive_qat_converted_best.pth    INT8 converted (best val — int8 model)
-    AutoDrive_qat_converted_final.pth   INT8 converted (last epoch, use for ONNX)
+    AutoDrive_qat_last.pth              QAT prepared — latest epoch (resumable)
+    AutoDrive_qat_best.pth              QAT prepared — best val loss (use this)
+    AutoDrive_qat_converted_final.pth   INT8 converted — from best prepared model
     epochs/
-      AutoDrive_qat_ep{N:03d}.pth           QAT prepared  checkpoint per epoch
-      AutoDrive_qat_int8_ep{N:03d}.pth      INT8 converted checkpoint per epoch
+      AutoDrive_qat_ep{N:03d}.pth       QAT prepared checkpoint per epoch
   tensorboard/
 
-TensorBoard:
-  tensorboard --logdir {root}/training/autodrive_qat/{run_name}/tensorboard/
-
-  Tags:
-    Loss/train_*              per-step train losses
-    Loss/train_avg_*          epoch-averaged train losses
-    Loss/val_prepared_*       validation on QAT-prepared model (fake-quantize, float)
-    Loss/val_int8_*           validation on INT8-converted model
-    Metrics/prepared_*        steer_mae, dist_mae, flag_acc for prepared model
-    Metrics/int8_*            same metrics for INT8 model
-    Metrics/quant_gap_*       prepared − int8  (shows quantization degradation)
+TensorBoard tags:
+    Loss/train_*         per-step train losses
+    Loss/train_avg_*     epoch-averaged train losses
+    Loss/val_*           validation losses on QAT-prepared model
+    Metrics/val_*        steer_mae, dist_mae, flag_acc (prepared model)
     Metrics/lr
-    Info/model_size_float_MB  float model size in MB
-    Info/model_size_int8_MB   INT8 converted model size in MB
+    Info/model_size_*    float vs INT8 model sizes (logged at start + end)
 """
 
 import copy
@@ -237,17 +237,21 @@ def _export_and_prepare_xnnpack(
     device: torch.device,
 ) -> torch.nn.Module:
     """
-    Step 1 — Export float model to an ATen graph (torch.export).
-    Step 2 — Prepare for QAT using XNNPACKQuantizer (symmetric INT8).
-    Returns the QAT-prepared GraphModule with fake-quantize nodes inserted.
-    """
-    float_model.eval()
-    float_model.to(device)
+    Step 1 — Export the float model to an ATen graph on CPU.
+    Step 2 — Prepare for QAT using XNNPACKQuantizer (symmetric INT8) on CPU.
+    Step 3 — Move the fully-prepared GraphModule to the target device.
 
-    # Batch=2 so the exporter sees a truly dynamic batch axis (batch=1 gets
-    # specialized as a compile-time constant by the exporter).
-    img_prev_ex = torch.randn(2, 3, 512, 1024, device=device)
-    img_curr_ex = torch.randn(2, 3, 512, 1024, device=device)
+    Export and prepare must happen on CPU because torch.export creates ATen
+    constant-tensor nodes that are not moved by module.to(device), causing
+    a multi-device assertion inside prepare_qat_pt2e.  Moving the final
+    prepared module to GPU works fine.
+    """
+    float_model.eval().cpu()
+
+    # Batch=2 so the exporter treats the batch axis as dynamic (batch=1 gets
+    # specialised as a compile-time constant by the exporter).
+    img_prev_ex = torch.randn(2, 3, 512, 1024)   # CPU
+    img_curr_ex = torch.randn(2, 3, 512, 1024)
     example_inputs = (img_prev_ex, img_curr_ex)
 
     batch_dim = torch.export.Dim("batch", min=2, max=128)
@@ -256,7 +260,7 @@ def _export_and_prepare_xnnpack(
         {0: batch_dim},   # img_curr  (B, 3, 512, 1024)
     )
 
-    print("  [1/2] Exporting AutoDrive to ATen graph …")
+    print("  [1/3] Exporting AutoDrive to ATen graph (CPU) …")
     exported = torch.export.export(
         float_model,
         example_inputs,
@@ -265,14 +269,18 @@ def _export_and_prepare_xnnpack(
     ).module()
 
     # XNNPACKQuantizer — XNNPACK symmetric INT8
-    #   is_qat=True   → fuses Conv2d+BN before inserting fake-quantizes
+    #   is_qat=True    → fuses Conv2d+BN before inserting fake-quantizes
     #   is_per_channel → per-channel weight quantization (better accuracy)
     quantizer = XNNPACKQuantizer().set_global(
         get_symmetric_quantization_config(is_per_channel=True, is_qat=True)
     )
 
-    print("  [2/2] Inserting fake-quantize nodes (XNNPACK symmetric INT8) …")
-    prepared = prepare_qat_pt2e(exported, quantizer)
+    print("  [2/3] Inserting fake-quantize nodes (XNNPACK symmetric INT8) …")
+    prepared = prepare_qat_pt2e(exported, quantizer)   # runs on CPU
+
+    # Move to target device AFTER prepare so all ATen constants are consistent
+    print(f"  [3/3] Moving prepared model to {device} …")
+    prepared.to(device)
     return prepared
 
 
@@ -292,23 +300,15 @@ def _get_qat_lr(epoch: int) -> float:
 # TensorBoard helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _tb_val(writer: SummaryWriter, tag_prefix: str, m: dict, step: int):
-    """Log a full validation metrics dict under tag_prefix."""
-    writer.add_scalar(f"Loss/{tag_prefix}_total",       m["total"],       step)
-    writer.add_scalar(f"Loss/{tag_prefix}_curvature",   m["curv"],        step)
-    writer.add_scalar(f"Loss/{tag_prefix}_distance",    m["dist"],        step)
-    writer.add_scalar(f"Loss/{tag_prefix}_flag",        m["flag"],        step)
-    writer.add_scalar(f"Metrics/{tag_prefix}_flag_acc", m["flag_acc"],    step)
-    writer.add_scalar(f"Metrics/{tag_prefix}_dist_mae", m["dist_mae_m"],  step)
-    writer.add_scalar(f"Metrics/{tag_prefix}_steer_mae",m["steer_mae_deg"],step)
-
-
-def _tb_quant_gap(writer: SummaryWriter, prepared: dict, int8: dict, step: int):
-    """Log prepared − int8 metric deltas so the quantization gap is visible."""
-    writer.add_scalar("Metrics/quant_gap_total",     prepared["total"]       - int8["total"],       step)
-    writer.add_scalar("Metrics/quant_gap_steer_mae", prepared["steer_mae_deg"] - int8["steer_mae_deg"], step)
-    writer.add_scalar("Metrics/quant_gap_dist_mae",  prepared["dist_mae_m"]  - int8["dist_mae_m"],  step)
-    writer.add_scalar("Metrics/quant_gap_flag_acc",  prepared["flag_acc"]    - int8["flag_acc"],    step)
+def _tb_val(writer: SummaryWriter, m: dict, step: int):
+    """Log the full validation metrics dict for the QAT-prepared (float) model."""
+    writer.add_scalar("Loss/val_total",          m["total"],          step)
+    writer.add_scalar("Loss/val_curvature",      m["curv"],           step)
+    writer.add_scalar("Loss/val_distance",       m["dist"],           step)
+    writer.add_scalar("Loss/val_flag",           m["flag"],           step)
+    writer.add_scalar("Metrics/val_flag_acc",    m["flag_acc"],       step)
+    writer.add_scalar("Metrics/val_dist_mae_m",  m["dist_mae_m"],     step)
+    writer.add_scalar("Metrics/val_steer_mae_deg", m["steer_mae_deg"], step)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -365,7 +365,6 @@ def main():
 
     ckpt_last          = ckpt_dir / "AutoDrive_qat_last.pth"
     ckpt_best_prepared = ckpt_dir / "AutoDrive_qat_best.pth"
-    ckpt_best_int8     = ckpt_dir / "AutoDrive_qat_converted_best.pth"
     ckpt_final_int8    = ckpt_dir / "AutoDrive_qat_converted_final.pth"
 
     print(f"Run         : {run_dir}")
@@ -412,9 +411,8 @@ def main():
     writer = SummaryWriter(log_dir=str(tb_dir))
     writer.add_scalar("Info/model_size_float_MB", float_size_mb, 0)
 
-    best_prepared_val = float("inf")
-    best_int8_val     = float("inf")
-    global_step       = 0
+    best_val_loss = float("inf")
+    global_step   = 0
 
     # ────────────────────────────────────────────────────────────────────
     # QAT training loop
@@ -513,99 +511,91 @@ def main():
         torch.save(prepared_model.state_dict(), ckpt_last)
         print(f"\n  Saved QAT prepared  → {ep_prepared_path.name}")
 
-        # ── Convert to INT8 (deepcopy so prepared_model stays intact) ─
-        print("  Converting to INT8 (convert_pt2e) …")
-        int8_model = convert_pt2e(copy.deepcopy(prepared_model))
-        int8_model.to(device)
-        int8_size_mb = _model_size_mb(int8_model)
-        writer.add_scalar("Info/model_size_int8_MB", int8_size_mb, epoch + 1)
-
-        ep_int8_path = epoch_dir / f"AutoDrive_qat_int8_ep{epoch+1:03d}.pth"
-        torch.save(int8_model.state_dict(), ep_int8_path)
-        print(f"  Saved INT8 converted → {ep_int8_path.name}  "
-              f"({int8_size_mb:.1f} MB vs float {float_size_mb:.1f} MB)")
-
-        # ── Validate prepared model (fake-quantize, float-equivalent) ─
-        print("\n  Validating QAT-prepared model (float) …")
+        # ── Validate QAT-prepared model (fake-quantize, float) ────────
+        # We validate the PREPARED model, NOT an INT8-converted copy.
+        # convert_pt2e is called only ONCE at the end, on the best checkpoint.
+        print("  Validating …")
         pt2e_utils.move_exported_model_to_eval(prepared_model)
-        m_prep = _run_val(prepared_model, val_loader, l1, bce, device, label="prepared")
-        _tb_val(writer, "val_prepared", m_prep, epoch + 1)
-
-        # ── Validate INT8 converted model ─────────────────────────────
-        print("  Validating INT8-converted model …")
-        pt2e_utils.move_exported_model_to_eval(int8_model)
-        m_int8 = _run_val(int8_model, val_loader, l1, bce, device, label="int8")
-        _tb_val(writer, "val_int8", m_int8, epoch + 1)
-
-        # ── Quantization gap ─────────────────────────────────────────
-        _tb_quant_gap(writer, m_prep, m_int8, epoch + 1)
+        m = _run_val(prepared_model, val_loader, l1, bce, device, label="val")
+        _tb_val(writer, m, epoch + 1)
 
         # ── Console summary ───────────────────────────────────────────
         print(
-            f"\n  ┌{'─'*60}┐\n"
-            f"  │  Epoch {epoch+1:>3d} validation summary{' '*25}│\n"
-            f"  ├{'─'*60}┤\n"
-            f"  │  {'Metric':<24} {'Prepared (float)':>16}  {'INT8':>12}  │\n"
-            f"  ├{'─'*60}┤\n"
-            f"  │  {'Val loss (total)':<24} {m_prep['total']:>16.4f}  {m_int8['total']:>12.4f}  │\n"
-            f"  │  {'Curvature loss':<24} {m_prep['curv']:>16.4f}  {m_int8['curv']:>12.4f}  │\n"
-            f"  │  {'Distance loss':<24} {m_prep['dist']:>16.4f}  {m_int8['dist']:>12.4f}  │\n"
-            f"  │  {'Flag loss':<24} {m_prep['flag']:>16.4f}  {m_int8['flag']:>12.4f}  │\n"
-            f"  │  {'Steering MAE (deg)':<24} {m_prep['steer_mae_deg']:>16.2f}  {m_int8['steer_mae_deg']:>12.2f}  │\n"
-            f"  │  {'Distance MAE (m)':<24} {m_prep['dist_mae_m']:>16.2f}  {m_int8['dist_mae_m']:>12.2f}  │\n"
-            f"  │  {'CIPO flag acc (%)':<24} {m_prep['flag_acc']:>16.2f}  {m_int8['flag_acc']:>12.2f}  │\n"
-            f"  └{'─'*60}┘"
+            f"\n  ┌{'─'*46}┐\n"
+            f"  │  Epoch {epoch+1:>3d} — QAT-prepared validation    │\n"
+            f"  ├{'─'*46}┤\n"
+            f"  │  {'Val loss (total)':<28} {m['total']:>8.4f}     │\n"
+            f"  │  {'Curvature loss':<28} {m['curv']:>8.4f}     │\n"
+            f"  │  {'Distance loss':<28} {m['dist']:>8.4f}     │\n"
+            f"  │  {'Flag loss':<28} {m['flag']:>8.4f}     │\n"
+            f"  │  {'Steering MAE (deg)':<28} {m['steer_mae_deg']:>8.2f}     │\n"
+            f"  │  {'Distance MAE (m)':<28} {m['dist_mae_m']:>8.2f}     │\n"
+            f"  │  {'CIPO flag acc (%)':<28} {m['flag_acc']:>8.2f}     │\n"
+            f"  └{'─'*46}┘"
         )
 
-        # ── Best model tracking ───────────────────────────────────────
-        if m_prep["total"] < best_prepared_val:
-            best_prepared_val = m_prep["total"]
+        # ── Best checkpoint tracking ──────────────────────────────────
+        if m["total"] < best_val_loss:
+            best_val_loss = m["total"]
             torch.save(prepared_model.state_dict(), ckpt_best_prepared)
-            print(f"  ★ New best QAT-prepared val loss: {best_prepared_val:.4f} "
+            print(f"  ★ New best QAT val loss: {best_val_loss:.4f} "
                   f"→ {ckpt_best_prepared.name}")
-
-        if m_int8["total"] < best_int8_val:
-            best_int8_val = m_int8["total"]
-            torch.save(int8_model.state_dict(), ckpt_best_int8)
-            print(f"  ★ New best INT8 val loss:         {best_int8_val:.4f} "
-                  f"→ {ckpt_best_int8.name}")
 
         writer.flush()
 
-        # Return prepared model to train mode for next epoch
+        # Return to train mode for the next epoch
         pt2e_utils.move_exported_model_to_train(prepared_model)
 
     # ─────────────────────────────────────────────────────────────────────
-    # Final conversion + save
+    # Final INT8 conversion — called ONCE on the best-trained checkpoint
     # ─────────────────────────────────────────────────────────────────────
     print(f"\n{'='*64}")
-    print("  Final INT8 conversion (last epoch weights) …")
+    print("  Loading best QAT checkpoint for final INT8 conversion …")
+    prepared_model.load_state_dict(torch.load(ckpt_best_prepared, weights_only=True))
+    prepared_model.to(device)
+
+    print("  Converting to INT8 (convert_pt2e) …")
     final_int8 = convert_pt2e(copy.deepcopy(prepared_model))
     final_int8.to(device)
     pt2e_utils.move_exported_model_to_eval(final_int8)
     torch.save(final_int8.state_dict(), ckpt_final_int8)
-    print(f"  Saved → {ckpt_final_int8}")
+    int8_size_mb = _model_size_mb(final_int8)
+    writer.add_scalar("Info/model_size_int8_MB", int8_size_mb, args.epochs)
+    print(f"  Saved → {ckpt_final_int8.name}")
 
-    # Final validation
-    m_final = _run_val(final_int8, val_loader, l1, bce, device, label="final")
+    # Validate the final INT8 model
+    print("  Validating final INT8 model …")
+    m_int8 = _run_val(final_int8, val_loader, l1, bce, device, label="int8_final")
+    # Log final INT8 results alongside the best prepared epoch for comparison
+    writer.add_scalar("Loss/final_int8_total",         m_int8["total"],         args.epochs)
+    writer.add_scalar("Metrics/final_int8_flag_acc",   m_int8["flag_acc"],      args.epochs)
+    writer.add_scalar("Metrics/final_int8_steer_mae",  m_int8["steer_mae_deg"], args.epochs)
+    writer.add_scalar("Metrics/final_int8_dist_mae_m", m_int8["dist_mae_m"],    args.epochs)
+    writer.flush()
+
     print(
-        f"\n  [Final INT8 Val]  loss {m_final['total']:.4f}  "
-        f"steer_mae {m_final['steer_mae_deg']:.2f}°  "
-        f"flag_acc {m_final['flag_acc']:.1f}%  "
-        f"dist_mae {m_final['dist_mae_m']:.1f} m"
+        f"\n  ┌{'─'*46}┐\n"
+        f"  │  Final INT8 validation (best prepared ckpt)  │\n"
+        f"  ├{'─'*46}┤\n"
+        f"  │  {'Val loss (total)':<28} {m_int8['total']:>8.4f}     │\n"
+        f"  │  {'Steering MAE (deg)':<28} {m_int8['steer_mae_deg']:>8.2f}     │\n"
+        f"  │  {'Distance MAE (m)':<28} {m_int8['dist_mae_m']:>8.2f}     │\n"
+        f"  │  {'CIPO flag acc (%)':<28} {m_int8['flag_acc']:>8.2f}     │\n"
+        f"  └{'─'*46}┘"
     )
     print(f"\n  Float size : {float_size_mb:.1f} MB")
-    print(f"  INT8  size : {_model_size_mb(final_int8):.1f} MB  "
-          f"({100*(1 - _model_size_mb(final_int8)/float_size_mb):.0f}% smaller)")
+    print(f"  INT8  size : {int8_size_mb:.1f} MB")
 
     # ── Optional ONNX export ──────────────────────────────────────────────
     if args.export_onnx:
         onnx_path = ckpt_dir / "AutoDrive_qat_int8.onnx"
         print(f"\n  Exporting INT8 ONNX → {onnx_path}")
-        img_prev_ex = torch.randn(1, 3, 512, 1024, device=device)
-        img_curr_ex = torch.randn(1, 3, 512, 1024, device=device)
+        # ONNX export must run on CPU
+        final_int8_cpu = final_int8.cpu()
+        img_prev_ex = torch.randn(1, 3, 512, 1024)
+        img_curr_ex = torch.randn(1, 3, 512, 1024)
         torch.onnx.export(
-            final_int8,
+            final_int8_cpu,
             (img_prev_ex, img_curr_ex),
             str(onnx_path),
             opset_version=17,
@@ -625,8 +615,8 @@ def main():
     writer.close()
     print(f"\n{'='*64}")
     print(f"  QAT complete.  Outputs in: {run_dir}")
-    print(f"  Use {ckpt_best_int8.name} or {ckpt_final_int8.name}")
-    print(f"  for INT8 ONNX export via convert_pytorch_to_onnx.py")
+    print(f"  Best QAT prepared   : {ckpt_best_prepared.name}")
+    print(f"  Final INT8 converted: {ckpt_final_int8.name}")
     print(f"{'='*64}\n")
 
 
