@@ -1,623 +1,409 @@
 """
-Quantization-Aware Training (QAT) for AutoDrive — PyTorch 2 Export / XNNPACK flow.
+AutoDrive QAT — Quantization-Aware Training + INT8 ONNX export + benchmark.
 
-Why convert_pt2e is called ONLY at the end
-──────────────────────────────────────────
-Calling convert_pt2e mid-training gives misleading, degraded results. While the
-fake-quantize nodes are still calibrating and weights are still changing, the
-converted INT8 model is essentially a half-trained snapshot.  The flag head (BCE
-loss) is particularly sensitive — logit precision errors under INT8 rounding push
-binary classification accuracy to near-random levels even when the float model is
-learning well.
+One script, one run.
 
-The correct flow (matching the PyTorch PT2E tutorial) is:
-  1. Train the prepared model to convergence — observers calibrate throughout.
-  2. Save the best prepared checkpoint each epoch (fake-quantize, float weights).
-  3. Call convert_pt2e ONCE at the very end on the best-trained checkpoint.
-
-The resulting converted model is then used to export INT8 ONNX via the standard
-convert_pytorch_to_onnx.py script.
-
-Dependencies (install once):
-  pip install torchao executorch
-
-──────────────────────────────────────────────────────────────────
 Usage
-──────────────────────────────────────────────────────────────────
+─────
+  # Train only
+  python Models/training/train_autodrive_qat.py \\
+      --root ~/data/zod \\
+      --checkpoint ~/data/zod/training/autodrive/run002/checkpoints/AutoDrive_best.pth
+
+  # Train → convert → export ONNX → benchmark
   python Models/training/train_autodrive_qat.py \\
       --root ~/data/zod \\
       --checkpoint ~/data/zod/training/autodrive/run002/checkpoints/AutoDrive_best.pth \\
-      --epochs 10 \\
-      --batch-size 8 \\
-      --workers 2
+      --export-onnx --benchmark
 
-──────────────────────────────────────────────────────────────────
 Outputs  →  {root}/training/autodrive_qat/{run_name}/
-──────────────────────────────────────────────────────────────────
-  checkpoints/
-    AutoDrive_qat_last.pth              QAT prepared — latest epoch (resumable)
-    AutoDrive_qat_best.pth              QAT prepared — best val loss (use this)
-    AutoDrive_qat_converted_final.pth   INT8 converted — from best prepared model
-    epochs/
-      AutoDrive_qat_ep{N:03d}.pth       QAT prepared checkpoint per epoch
+  checkpoints/AutoDrive_qat_last.pth        QAT prepared  (latest, resumable)
+  checkpoints/AutoDrive_qat_best.pth        QAT prepared  (best val loss)
+  checkpoints/AutoDrive_qat_converted.pth   INT8 converted (from best)
+  checkpoints/AutoDrive_qat_int8.onnx       INT8 ONNX      (with --export-onnx)
   tensorboard/
 
-TensorBoard tags:
-    Loss/train_*         per-step train losses
-    Loss/train_avg_*     epoch-averaged train losses
-    Loss/val_*           validation losses on QAT-prepared model
-    Metrics/val_*        steer_mae, dist_mae, flag_acc (prepared model)
-    Metrics/lr
-    Info/model_size_*    float vs INT8 model sizes (logged at start + end)
+Notes
+─────
+  • XNNPACKQuantizer, per-tensor (is_per_channel=False).
+    Per-tensor is the only config the ONNX exporter supports.
+  • convert_pt2e is called ONCE at the end on the best checkpoint.
+    Calling it every epoch gives bad results (observers still calibrating).
+  • ONNX export: calibrates with val data, then dynamo-exports.
 """
 
-import copy
-import math
-import os
-import sys
-import tempfile
+import copy, math, sys
 from argparse import ArgumentParser
 from pathlib import Path
 
-import torch
-import torch.nn as nn
-import tqdm
+import torch, torch.nn as nn, tqdm
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
-# ── XNNPACKQuantizer (XNNPACK backend) ────────────────────────────────────
 from executorch.backends.xnnpack.quantizer.xnnpack_quantizer import (
-    XNNPACKQuantizer,
-    get_symmetric_quantization_config,
+    XNNPACKQuantizer, get_symmetric_quantization_config,
 )
-
-# ── torchao PT2E core APIs ─────────────────────────────────────────────────
 import torchao.quantization.pt2e as pt2e_utils
 from torchao.quantization.pt2e.quantize_pt2e import prepare_qat_pt2e, convert_pt2e
 
-# ── Repo imports ────────────────────────────────────────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from Models.model_components.autodrive.autodrive_network import AutoDrive
 from Models.data_utils.load_data_auto_drive import LoadDataAutoDrive, CURV_SCALE
 from Models.training.auto_drive_trainer import AverageMeter
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Constants — kept identical to AutoDriveTrainer
-# ─────────────────────────────────────────────────────────────────────────────
-_CIPO_POS_WEIGHT       = torch.tensor([0.295 / 0.705])
-_CURV_LOSS_W           = 2.0
-_DIST_LOSS_W           = 2.0
-_FLAG_VAL_THRESHOLD    = 0.65
-_WHEELBASE_M           = 2.984
-_STEERING_COLUMN_RATIO = 16.8
+# ── constants (same as AutoDriveTrainer) ────────────────────────────────────
+_POS_W   = torch.tensor([0.295 / 0.705])
+_CW, _DW = 2.0, 2.0          # curvature / distance loss weights
+_THR     = 0.65               # flag classification threshold
+_WB      = 2.984              # wheelbase (m)
+_SCR     = 16.8               # steering column ratio
 
 
-def _collate(batch: list[dict]) -> dict:
-    return {k: torch.stack([b[k] for b in batch]) for k in batch[0]}
+def _collate(b):
+    return {k: torch.stack([x[k] for x in b]) for k in b[0]}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Loss helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# ── loss + metrics ───────────────────────────────────────────────────────────
 
-def _compute_loss(
-    model_out: tuple,
-    d_norm_gt: torch.Tensor,
-    curvature_gt: torch.Tensor,
-    flag_gt: torch.Tensor,
-    dist_mask: torch.Tensor,
-    l1: nn.L1Loss,
-    bce: nn.BCEWithLogitsLoss,
-    device: torch.device,
-) -> tuple[torch.Tensor, float, float, float]:
-    """Total loss + component scalars. Mirrors AutoDriveTrainer joint-mode loss."""
-    d_pred, curv_pred, flag_logits = model_out
-
-    loss_c = l1(curv_pred, curvature_gt)
-
-    if dist_mask.any():
-        mask_idx = dist_mask.unsqueeze(1)
-        loss_d   = l1(d_pred[mask_idx], d_norm_gt[mask_idx])
-    else:
-        loss_d = torch.tensor(0.0, device=device)
-
-    loss_f = bce(flag_logits, flag_gt)
-    total  = _CURV_LOSS_W * loss_c + _DIST_LOSS_W * loss_d + loss_f
-    return total, loss_c.item(), loss_d.item(), loss_f.item()
+def _loss(out, d_gt, c_gt, f_gt, mask, l1, bce, dev):
+    d, c, fl = out
+    lc = l1(c, c_gt)
+    ld = l1(d[mask.unsqueeze(1)], d_gt[mask.unsqueeze(1)]) if mask.any() else torch.tensor(0., device=dev)
+    lf = bce(fl, f_gt)
+    return _CW * lc + _DW * ld + lf, lc.item(), ld.item(), lf.item()
 
 
 @torch.no_grad()
-def _compute_val_metrics(
-    model_out: tuple,
-    d_norm_gt: torch.Tensor,
-    curvature_gt: torch.Tensor,
-    flag_gt: torch.Tensor,
-    dist_mask: torch.Tensor,
-    l1: nn.L1Loss,
-    bce: nn.BCEWithLogitsLoss,
-    device: torch.device,
-) -> dict:
-    """Returns a dict with all validation metrics. Mirrors AutoDriveTrainer.validate()."""
-    d_pred, curv_pred, flag_logits = model_out
-
-    loss_c = l1(curv_pred, curvature_gt)
-    if dist_mask.any():
-        mask_idx   = dist_mask.unsqueeze(1)
-        loss_d     = l1(d_pred[mask_idx], d_norm_gt[mask_idx])
-        dist_mae_m = (150.0 * (d_pred[mask_idx] - d_norm_gt[mask_idx]).abs()).mean().item()
+def _metrics(out, d_gt, c_gt, f_gt, mask, l1, bce, dev):
+    d, c, fl = out
+    lc = l1(c, c_gt)
+    if mask.any():
+        mi = mask.unsqueeze(1)
+        ld = l1(d[mi], d_gt[mi]);  dm = (150.*(d[mi]-d_gt[mi]).abs()).mean().item()
     else:
-        loss_d     = torch.tensor(0.0, device=device)
-        dist_mae_m = 0.0
+        ld = torch.tensor(0., device=dev); dm = 0.
+    lf    = bce(fl, f_gt)
+    total = lc + ld + lf
+    facc  = ((torch.sigmoid(fl) > _THR).float() == f_gt).float().mean().item() * 100.
+    sc    = (c * CURV_SCALE);  sg = (c_gt * CURV_SCALE);  ss = _SCR * (180./math.pi)
+    smae  = (torch.atan(sc*_WB)*ss - torch.atan(sg*_WB)*ss).abs().mean().item()
+    return dict(total=total.item(), curv=lc.item(), dist=ld.item(), flag=lf.item(),
+                flag_acc=facc, dist_mae_m=dm, steer_mae_deg=smae)
 
-    loss_f = bce(flag_logits, flag_gt)
-    total  = loss_c + loss_d + loss_f
-
-    flag_prob  = torch.sigmoid(flag_logits)
-    pred_label = (flag_prob > _FLAG_VAL_THRESHOLD).float()
-    flag_acc   = (pred_label == flag_gt).float().mean().item() * 100.0
-
-    curv_pred_m    = curv_pred * CURV_SCALE
-    curv_gt_m      = curvature_gt * CURV_SCALE
-    steer_scale    = _STEERING_COLUMN_RATIO * (180.0 / math.pi)
-    steer_pred_deg = torch.atan(curv_pred_m * _WHEELBASE_M) * steer_scale
-    steer_gt_deg   = torch.atan(curv_gt_m   * _WHEELBASE_M) * steer_scale
-    steer_mae_deg  = (steer_pred_deg - steer_gt_deg).abs().mean().item()
-
-    return dict(
-        total=total.item(), dist=loss_d.item(), curv=loss_c.item(), flag=loss_f.item(),
-        flag_acc=flag_acc, dist_mae_m=dist_mae_m, steer_mae_deg=steer_mae_deg,
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Full validation pass over a loader
-# ─────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
-def _run_val(
-    model: torch.nn.Module,
-    loader: DataLoader,
-    l1: nn.L1Loss,
-    bce: nn.BCEWithLogitsLoss,
-    device: torch.device,
-    label: str = "",
-) -> dict:
-    """
-    Average validation metrics across the entire loader.
-    The caller is responsible for setting the model to eval mode before calling.
-    """
-    keys = ("total", "dist", "curv", "flag", "flag_acc", "dist_mae_m", "steer_mae_deg")
-    sums = {k: 0.0 for k in keys}
-    n    = 0
-
-    p_bar = tqdm.tqdm(loader, desc=f"  Val [{label}]", leave=False)
-    for batch in p_bar:
-        img_prev  = batch["img_prev"].to(device)
-        img_curr  = batch["img_curr"].to(device)
-        d_norm_gt = batch["d_norm"].unsqueeze(1).to(device)
-        curv_gt   = batch["curvature"].unsqueeze(1).to(device)
-        flag_gt   = batch["flag"].unsqueeze(1).to(device)
-        dist_mask = batch["dist_mask"].to(device)
-
-        out = model(img_prev, img_curr)
-        m   = _compute_val_metrics(out, d_norm_gt, curv_gt, flag_gt,
-                                   dist_mask, l1, bce, device)
-        for k in keys:
-            sums[k] += m[k]
+def _val(model, loader, l1, bce, dev, label=""):
+    keys = ("total","curv","dist","flag","flag_acc","dist_mae_m","steer_mae_deg")
+    S = {k: 0. for k in keys};  n = 0
+    for b in tqdm.tqdm(loader, desc=f"  val [{label}]", leave=False):
+        out = model(b["img_prev"].to(dev), b["img_curr"].to(dev))
+        m   = _metrics(out, b["d_norm"].unsqueeze(1).to(dev),
+                       b["curvature"].unsqueeze(1).to(dev),
+                       b["flag"].unsqueeze(1).to(dev),
+                       b["dist_mask"].to(dev), l1, bce, dev)
+        for k in keys: S[k] += m[k]
         n += 1
-
-    if n == 0:
-        return {k: 0.0 for k in keys}
-    return {k: sums[k] / n for k in keys}
+    return {k: S[k]/max(n,1) for k in keys}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Model size utility
-# ─────────────────────────────────────────────────────────────────────────────
+# ── export + prepare (CPU, then move to device) ──────────────────────────────
 
-def _model_size_mb(model: torch.nn.Module) -> float:
-    """Estimate model size in MB by saving to a temp file."""
-    with tempfile.NamedTemporaryFile(suffix=".pth", delete=False) as f:
-        tmp = f.name
-    try:
-        torch.save(model.state_dict(), tmp)
-        size_mb = os.path.getsize(tmp) / 1e6
-    finally:
-        os.remove(tmp)
-    return size_mb
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# PT2E export + XNNPACKQuantizer prepare
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _export_and_prepare_xnnpack(
-    float_model: AutoDrive,
-    device: torch.device,
-) -> torch.nn.Module:
-    """
-    Step 1 — Export the float model to an ATen graph on CPU.
-    Step 2 — Prepare for QAT using XNNPACKQuantizer (symmetric INT8) on CPU.
-    Step 3 — Move the fully-prepared GraphModule to the target device.
-
-    Export and prepare must happen on CPU because torch.export creates ATen
-    constant-tensor nodes that are not moved by module.to(device), causing
-    a multi-device assertion inside prepare_qat_pt2e.  Moving the final
-    prepared module to GPU works fine.
-    """
-    float_model.eval().cpu()
-
-    # Batch=2 so the exporter treats the batch axis as dynamic (batch=1 gets
-    # specialised as a compile-time constant by the exporter).
-    img_prev_ex = torch.randn(2, 3, 512, 1024)   # CPU
-    img_curr_ex = torch.randn(2, 3, 512, 1024)
-    example_inputs = (img_prev_ex, img_curr_ex)
-
-    batch_dim = torch.export.Dim("batch", min=2, max=128)
-    dynamic_shapes = (
-        {0: batch_dim},   # img_prev  (B, 3, 512, 1024)
-        {0: batch_dim},   # img_curr  (B, 3, 512, 1024)
-    )
-
-    print("  [1/3] Exporting AutoDrive to ATen graph (CPU) …")
+def _prepare(device):
+    """Export float AutoDrive, insert XNNPACK fake-quant nodes, move to device."""
+    m = AutoDrive().eval().cpu()
+    ex = (torch.randn(2,3,512,1024), torch.randn(2,3,512,1024))
+    bd = torch.export.Dim("batch", min=2, max=128)
     exported = torch.export.export(
-        float_model,
-        example_inputs,
-        dynamic_shapes=dynamic_shapes,
-        strict=False,
+        m, ex, dynamic_shapes=({0:bd},{0:bd}), strict=False
     ).module()
-
-    # XNNPACKQuantizer — XNNPACK symmetric INT8
-    #   is_qat=True    → fuses Conv2d+BN before inserting fake-quantizes
-    #   is_per_channel → per-channel weight quantization (better accuracy)
-    quantizer = XNNPACKQuantizer().set_global(
-        get_symmetric_quantization_config(is_per_channel=True, is_qat=True)
+    q = XNNPACKQuantizer().set_global(
+        get_symmetric_quantization_config(is_per_channel=False, is_qat=True)
     )
-
-    print("  [2/3] Inserting fake-quantize nodes (XNNPACK symmetric INT8) …")
-    prepared = prepare_qat_pt2e(exported, quantizer)   # runs on CPU
-
-    # Move to target device AFTER prepare so all ATen constants are consistent
-    print(f"  [3/3] Moving prepared model to {device} …")
+    prepared = prepare_qat_pt2e(exported, q)   # CPU
     prepared.to(device)
     return prepared
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LR schedule
-# ─────────────────────────────────────────────────────────────────────────────
+# ── ONNX export ───────────────────────────────────────────────────────────────
 
-def _get_qat_lr(epoch: int) -> float:
+def _export_onnx(best_ckpt, val_loader, onnx_path, calib_batches=100):
     """
-    Epoch 0–4  : 1e-5  — observers calibrate with gentle updates
-    Epoch 5+   : 5e-6  — fine-tune with frozen observer stats
+    Load best QAT checkpoint → calibrate on val data (CPU) → convert_pt2e → ONNX.
+    Returns onnx_path if successful, None otherwise.
     """
-    return 1e-5 if epoch < 5 else 5e-6
+    print("\n  Building INT8 model for ONNX export …")
+    prepared = _prepare(torch.device("cpu"))
+    sd = torch.load(best_ckpt, map_location="cpu", weights_only=True)
+    prepared.load_state_dict(sd, strict=False)   # strict=False: observer shapes may differ
+    pt2e_utils.move_exported_model_to_eval(prepared)
+
+    print(f"  Calibrating ({calib_batches} batches) …")
+    n = 0
+    with torch.no_grad():
+        for b in tqdm.tqdm(val_loader, total=calib_batches, leave=False):
+            prepared(b["img_prev"], b["img_curr"])
+            n += 1
+            if n >= calib_batches:
+                break
+
+    int8 = convert_pt2e(copy.deepcopy(prepared))
+    pt2e_utils.move_exported_model_to_eval(int8)
+
+    print(f"  Exporting ONNX → {onnx_path} …")
+    img = torch.randn(1, 3, 512, 1024)
+    torch.onnx.export(
+        int8, (img, img), str(onnx_path),
+        dynamo=True,
+        input_names=["image_prev", "image_curr"],
+        output_names=["distance", "curvature", "flag_logit"],
+        dynamic_shapes={
+            "image_prev": {0: torch.export.Dim("batch", min=1, max=64)},
+            "image_curr": {0: torch.export.Dim("batch", min=1, max=64)},
+        },
+    )
+    mb = onnx_path.stat().st_size / 1e6
+    print(f"  Saved ONNX ({mb:.1f} MB)")
+    return onnx_path, int8
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# TensorBoard helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# ── benchmark: FP32 vs INT8 ORT ───────────────────────────────────────────────
 
-def _tb_val(writer: SummaryWriter, m: dict, step: int):
-    """Log the full validation metrics dict for the QAT-prepared (float) model."""
-    writer.add_scalar("Loss/val_total",          m["total"],          step)
-    writer.add_scalar("Loss/val_curvature",      m["curv"],           step)
-    writer.add_scalar("Loss/val_distance",       m["dist"],           step)
-    writer.add_scalar("Loss/val_flag",           m["flag"],           step)
-    writer.add_scalar("Metrics/val_flag_acc",    m["flag_acc"],       step)
-    writer.add_scalar("Metrics/val_dist_mae_m",  m["dist_mae_m"],     step)
-    writer.add_scalar("Metrics/val_steer_mae_deg", m["steer_mae_deg"], step)
+import time as _time
+
+@torch.no_grad()
+def _benchmark(fp32_ckpt, int8_model, onnx_path, val_loader, device):
+    import numpy as np
+    try:
+        import onnxruntime as ort
+        sess = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+        has_ort = True
+    except ImportError:
+        print("  onnxruntime not installed — skipping ORT benchmark.")
+        has_ort = False
+
+    fp32 = AutoDrive()
+    ck   = torch.load(fp32_ckpt, map_location="cpu", weights_only=False)
+    fp32.load_state_dict(ck["model"] if "model" in ck else ck)
+    fp32.eval().to(device)
+
+    l1  = nn.L1Loss(); bce = nn.BCEWithLogitsLoss(pos_weight=_POS_W)
+    keys = ("total","curv","dist","flag","flag_acc","dist_mae_m","steer_mae_deg")
+    S32  = {k: 0. for k in keys};  t32  = 0.
+    Sort = {k: 0. for k in keys};  tort = 0.
+    n = 0
+
+    for b in tqdm.tqdm(val_loader, desc="  benchmark", leave=True):
+        ip = b["img_prev"]; ic = b["img_curr"]
+        dg = b["d_norm"].unsqueeze(1); cg = b["curvature"].unsqueeze(1)
+        fg = b["flag"].unsqueeze(1);   mk = b["dist_mask"]
+
+        t0 = _time.perf_counter()
+        out32 = fp32(ip.to(device), ic.to(device))
+        t32  += (_time.perf_counter()-t0)*1000.
+
+        m32 = _metrics(tuple(x.cpu() for x in out32), dg, cg, fg, mk, l1, bce, torch.device("cpu"))
+        for k in keys: S32[k] += m32[k]
+
+        if has_ort:
+            t0 = _time.perf_counter()
+            oo = sess.run(None, {"image_prev": ip.numpy(), "image_curr": ic.numpy()})
+            tort += (_time.perf_counter()-t0)*1000.
+            ort_out = tuple(torch.from_numpy(x) for x in oo)
+            mo = _metrics(ort_out, dg, cg, fg, mk, l1, bce, torch.device("cpu"))
+            for k in keys: Sort[k] += mo[k]
+
+        n += 1
+
+    for d in (S32, Sort):
+        for k in keys: d[k] /= max(n,1)
+
+    w = 18; sep = "─"*(30+w*(2 if has_ort else 1))
+    print(f"\n  ┌{sep}┐")
+    print(f"  │  {'FP32 vs INT8 ONNX benchmark':<{28+w*(2 if has_ort else 1)}}│")
+    print(f"  ├{sep}┤")
+    hdr = f"  │  {'Metric':<28}{'FP32 PyTorch':>{w}}"
+    if has_ort: hdr += f"{'INT8 ORT':>{w}}"
+    print(hdr+"  │")
+    print(f"  ├{sep}┤")
+    rows=[("Val loss","total",".4f"),("Curvature","curv",".4f"),("Distance","dist",".4f"),
+          ("Flag loss","flag",".4f"),("Steer MAE (°)","steer_mae_deg",".2f"),
+          ("Dist MAE (m)","dist_mae_m",".2f"),("Flag acc (%)","flag_acc",".2f")]
+    for nm,k,f in rows:
+        line=f"  │  {nm:<28}{S32[k]:>{w}{f}}"
+        if has_ort: line+=f"{Sort[k]:>{w}{f}}"
+        print(line+"  │")
+    fps32 = t32/max(n,1)/b["img_prev"].size(0)
+    fport = tort/max(n,1)/b["img_prev"].size(0) if has_ort else 0.
+    print(f"  │  {'ms / frame':<28}{fps32:>{w}.2f}"+(f"{fport:>{w}.2f}" if has_ort else "")+"  │")
+    print(f"  └{sep}┘\n")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
+# ── LR schedule ──────────────────────────────────────────────────────────────
+
+def _lr(epoch): return 1e-5 if epoch < 5 else 5e-6
+
+
+# ── main ─────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = ArgumentParser(
-        description="Quantization-Aware Training (QAT) for AutoDrive — XNNPACK INT8"
-    )
-    parser.add_argument("--root",       required=True,
-                        help="ZOD dataset root")
-    parser.add_argument("--checkpoint", required=True,
-                        help="Float AutoDrive .pth checkpoint to start QAT from")
-    parser.add_argument("--run-name",   default="",
-                        help="Sub-folder name (default: qat001, qat002, …)")
-    parser.add_argument("--epochs",     type=int, default=10,
-                        help="QAT epochs (default: 10)")
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--workers",    type=int, default=2)
-    parser.add_argument("--qat-lr",     type=float, default=0.0,
-                        help="Fixed QAT learning rate (0 = use built-in schedule)")
-    parser.add_argument("--observer-freeze-epoch", type=int, default=4,
-                        help="Freeze observer range stats after epoch N (default: 4)")
-    parser.add_argument("--bn-freeze-epoch",       type=int, default=3,
-                        help="Freeze BatchNorm running stats after epoch N (default: 3)")
-    parser.add_argument("--export-onnx", action="store_true",
-                        help="Export final INT8 model to ONNX after training")
-    args = parser.parse_args()
+    ap = ArgumentParser()
+    ap.add_argument("--root",        required=True)
+    ap.add_argument("--checkpoint",  required=True, help="Float AutoDrive .pth to start from")
+    ap.add_argument("--run-name",    default="")
+    ap.add_argument("--epochs",      type=int, default=10)
+    ap.add_argument("--batch-size",  type=int, default=8)
+    ap.add_argument("--workers",     type=int, default=2)
+    ap.add_argument("--lr",          type=float, default=0., help="Override LR (0=schedule)")
+    ap.add_argument("--obs-freeze",  type=int, default=4,  help="Freeze observers after epoch N")
+    ap.add_argument("--bn-freeze",   type=int, default=3,  help="Freeze BN stats after epoch N")
+    ap.add_argument("--export-onnx", action="store_true",  help="Convert + export INT8 ONNX after training")
+    ap.add_argument("--benchmark",   action="store_true",  help="Benchmark FP32 vs INT8 ORT after export")
+    args = ap.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\n{'='*64}")
-    print(f"  AutoDrive QAT  —  XNNPACK symmetric INT8")
-    print(f"  Device        : {device}")
-    print(f"  Float ckpt    : {args.checkpoint}")
-    print(f"  Epochs        : {args.epochs}")
-    print(f"  Batch size    : {args.batch_size}")
-    print(f"{'='*64}\n")
+    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\n{'='*60}\n  AutoDrive QAT — {dev}\n{'='*60}\n")
 
-    # ── Output directories ────────────────────────────────────────────────
-    base_dir = Path(args.root) / "training" / "autodrive_qat"
+    # directories
+    base = Path(args.root)/"training"/"autodrive_qat"
     if args.run_name:
-        run_name = args.run_name
+        rname = args.run_name
     else:
-        existing = sorted(base_dir.glob("qat[0-9][0-9][0-9]"))
-        run_name = f"qat{len(existing) + 1:03d}"
+        existing = sorted(base.glob("qat[0-9][0-9][0-9]"))
+        rname = f"qat{len(existing)+1:03d}"
+    run_dir  = base/rname
+    ckpt_dir = run_dir/"checkpoints"
+    tb_dir   = run_dir/"tensorboard"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    tb_dir.mkdir(parents=True, exist_ok=True)
 
-    run_dir    = base_dir / run_name
-    ckpt_dir   = run_dir / "checkpoints"
-    epoch_dir  = ckpt_dir / "epochs"
-    tb_dir     = run_dir / "tensorboard"
-    for d in (ckpt_dir, epoch_dir, tb_dir):
-        d.mkdir(parents=True, exist_ok=True)
+    ckpt_last  = ckpt_dir/"AutoDrive_qat_last.pth"
+    ckpt_best  = ckpt_dir/"AutoDrive_qat_best.pth"
+    ckpt_conv  = ckpt_dir/"AutoDrive_qat_converted.pth"
+    onnx_path  = ckpt_dir/"AutoDrive_qat_int8.onnx"
 
-    ckpt_last          = ckpt_dir / "AutoDrive_qat_last.pth"
-    ckpt_best_prepared = ckpt_dir / "AutoDrive_qat_best.pth"
-    ckpt_final_int8    = ckpt_dir / "AutoDrive_qat_converted_final.pth"
+    print(f"  Run  : {run_dir}")
+    print(f"  TB   : tensorboard --logdir {tb_dir}\n")
 
-    print(f"Run         : {run_dir}")
-    print(f"TensorBoard : tensorboard --logdir {tb_dir}\n")
-
-    # ── Data ────────────────────────────────────────────────────────────
+    # data
     data = LoadDataAutoDrive(args.root)
-    train_loader = DataLoader(
-        data.train, batch_size=args.batch_size, shuffle=True,
-        num_workers=args.workers, collate_fn=_collate, drop_last=True,
-    )
-    val_loader = DataLoader(
-        data.val, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, collate_fn=_collate,
-    )
-    print(f"Dataset  →  Train: {len(data.train):,}   Val: {len(data.val):,}")
+    train_loader = DataLoader(data.train, args.batch_size, shuffle=True,
+                              num_workers=args.workers, collate_fn=_collate, drop_last=True)
+    val_loader   = DataLoader(data.val,   args.batch_size, shuffle=False,
+                              num_workers=args.workers, collate_fn=_collate)
+    print(f"  Train {len(data.train):,}  Val {len(data.val):,}\n")
 
-    # ── Load float model + measure its size ─────────────────────────────
-    print(f"\nLoading float checkpoint ← {args.checkpoint}")
-    float_model = AutoDrive()
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    if isinstance(ckpt, dict) and "model" in ckpt:
-        float_model.load_state_dict(ckpt["model"])
-    else:
-        float_model.load_state_dict(ckpt)
-    float_model.to(device)
-    float_size_mb = _model_size_mb(float_model)
-    print(f"  Float model size : {float_size_mb:.1f} MB")
+    # float model
+    ck = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    float_sd = ck["model"] if isinstance(ck, dict) and "model" in ck else ck
 
-    # ── Export + prepare QAT with XNNPACKQuantizer ───────────────────────
-    print()
-    prepared_model = _export_and_prepare_xnnpack(float_model, device)
-    prepared_model.to(device)
-    print(f"  QAT model ready  : {type(prepared_model).__name__}")
+    # export + prepare (CPU → move to dev)
+    print("  Preparing QAT model …")
+    model = _prepare(dev)
+    # load float weights into prepared graph
+    float_m = AutoDrive(); float_m.load_state_dict(float_sd)
+    float_m.eval().to(dev)
+    # copy float state dict into prepared model (strict=False is safe here)
+    model.load_state_dict(float_sd, strict=False)
+    print(f"  Model ready on {dev}\n")
 
-    # ── Optimizer + loss functions ───────────────────────────────────────
-    lr_init   = args.qat_lr if args.qat_lr > 0 else _get_qat_lr(0)
-    optimizer = torch.optim.Adam(
-        prepared_model.parameters(), lr=lr_init, weight_decay=1e-5
-    )
-    l1  = nn.L1Loss()
-    bce = nn.BCEWithLogitsLoss(pos_weight=_CIPO_POS_WEIGHT.to(device))
+    l1   = nn.L1Loss()
+    bce  = nn.BCEWithLogitsLoss(pos_weight=_POS_W.to(dev))
+    opt  = torch.optim.Adam(model.parameters(),
+                             lr=args.lr if args.lr > 0 else _lr(0), weight_decay=1e-5)
+    tb   = SummaryWriter(str(tb_dir))
+    best = float("inf");  step = 0
 
-    writer = SummaryWriter(log_dir=str(tb_dir))
-    writer.add_scalar("Info/model_size_float_MB", float_size_mb, 0)
+    _BN = {torch.ops.aten._native_batch_norm_legit.default,
+           torch.ops.aten.cudnn_batch_norm.default,
+           torch.ops.aten._native_batch_norm_legit_no_training.default}
 
-    best_val_loss = float("inf")
-    global_step   = 0
-
-    # ────────────────────────────────────────────────────────────────────
-    # QAT training loop
-    # ────────────────────────────────────────────────────────────────────
     for epoch in range(args.epochs):
-        print(f"\n{'='*64}")
-        print(f"  QAT  Epoch {epoch+1:>3d}/{args.epochs}   "
-              f"[observer_freeze≥{args.observer_freeze_epoch}, "
-              f"bn_freeze≥{args.bn_freeze_epoch}]")
-        print(f"{'='*64}")
+        lr = args.lr if args.lr > 0 else _lr(epoch)
+        for pg in opt.param_groups: pg["lr"] = lr
 
-        new_lr = args.qat_lr if args.qat_lr > 0 else _get_qat_lr(epoch)
-        for pg in optimizer.param_groups:
-            pg["lr"] = new_lr
-        writer.add_scalar("Metrics/lr", new_lr, epoch + 1)
+        if epoch >= args.obs_freeze:
+            model.apply(pt2e_utils.disable_observer)
+        if epoch >= args.bn_freeze:
+            for n in model.graph.nodes:
+                if n.target in _BN and len(n.args) > 5:
+                    a = list(n.args); a[5] = False; n.args = tuple(a)
+            model.recompile()
 
-        # ── Optionally freeze observer / BN stats ─────────────────────
-        if epoch >= args.observer_freeze_epoch:
-            print(f"  ▸ Freezing observer range stats (epoch ≥ {args.observer_freeze_epoch})")
-            prepared_model.apply(pt2e_utils.disable_observer)
+        pt2e_utils.move_exported_model_to_train(model)
+        avg = AverageMeter(); ac = AverageMeter(); ad = AverageMeter(); af = AverageMeter()
 
-        if epoch >= args.bn_freeze_epoch:
-            print(f"  ▸ Freezing BatchNorm running stats (epoch ≥ {args.bn_freeze_epoch})")
-            _bn_targets = {
-                torch.ops.aten._native_batch_norm_legit.default,
-                torch.ops.aten.cudnn_batch_norm.default,
-                torch.ops.aten._native_batch_norm_legit_no_training.default,
-            }
-            for n in prepared_model.graph.nodes:
-                if n.target in _bn_targets and len(n.args) > 5:
-                    new_args    = list(n.args)
-                    new_args[5] = False   # training=False
-                    n.args      = tuple(new_args)
-            prepared_model.recompile()
+        bar = tqdm.tqdm(train_loader, desc=f"  ep {epoch+1}/{args.epochs}")
+        for b in bar:
+            out = model(b["img_prev"].to(dev), b["img_curr"].to(dev))
+            loss, lc, ld, lf = _loss(out,
+                b["d_norm"].unsqueeze(1).to(dev), b["curvature"].unsqueeze(1).to(dev),
+                b["flag"].unsqueeze(1).to(dev),   b["dist_mask"].to(dev), l1, bce, dev)
+            opt.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 10.)
+            opt.step()
+            bs = b["img_prev"].size(0)
+            avg.update(loss.item(),bs); ac.update(lc,bs); ad.update(ld,bs); af.update(lf,bs)
+            step += 1
+            tb.add_scalar("Loss/train_total",     loss.item(), step)
+            tb.add_scalar("Loss/train_curvature",  lc, step)
+            tb.add_scalar("Loss/train_distance",   ld, step)
+            tb.add_scalar("Loss/train_flag",       lf, step)
+            bar.set_postfix(loss=f"{avg.avg:.4f}", c=f"{ac.avg:.4f}",
+                            d=f"{ad.avg:.4f}", f=f"{af.avg:.4f}", lr=f"{lr:.1e}")
 
-        # ── Train ─────────────────────────────────────────────────────
-        pt2e_utils.move_exported_model_to_train(prepared_model)
+        tb.add_scalar("Loss/train_avg", avg.avg, epoch+1)
+        tb.add_scalar("Metrics/lr",     lr,      epoch+1)
 
-        avg_total = AverageMeter()
-        avg_curv  = AverageMeter()
-        avg_dist  = AverageMeter()
-        avg_flag  = AverageMeter()
+        torch.save(model.state_dict(), ckpt_last)
 
-        p_bar = tqdm.tqdm(
-            train_loader,
-            desc=f"  Train {epoch+1}/{args.epochs}",
-            total=len(train_loader),
-        )
-        for batch in p_bar:
-            img_prev  = batch["img_prev"].to(device)
-            img_curr  = batch["img_curr"].to(device)
-            d_norm_gt = batch["d_norm"].unsqueeze(1).to(device)
-            curv_gt   = batch["curvature"].unsqueeze(1).to(device)
-            flag_gt   = batch["flag"].unsqueeze(1).to(device)
-            dist_mask = batch["dist_mask"].to(device)
+        pt2e_utils.move_exported_model_to_eval(model)
+        m = _val(model, val_loader, l1, bce, dev)
 
-            out = prepared_model(img_prev, img_curr)
-            loss, lc, ld, lf = _compute_loss(
-                out, d_norm_gt, curv_gt, flag_gt, dist_mask, l1, bce, device
-            )
+        tb.add_scalar("Loss/val_total",          m["total"],          epoch+1)
+        tb.add_scalar("Loss/val_curvature",       m["curv"],           epoch+1)
+        tb.add_scalar("Loss/val_distance",        m["dist"],           epoch+1)
+        tb.add_scalar("Loss/val_flag",            m["flag"],           epoch+1)
+        tb.add_scalar("Metrics/val_flag_acc",     m["flag_acc"],       epoch+1)
+        tb.add_scalar("Metrics/val_dist_mae_m",   m["dist_mae_m"],     epoch+1)
+        tb.add_scalar("Metrics/val_steer_mae_deg",m["steer_mae_deg"],  epoch+1)
+        tb.flush()
 
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(prepared_model.parameters(), max_norm=10.0)
-            optimizer.step()
+        print(f"\n  ep {epoch+1}  loss {m['total']:.4f}  "
+              f"steer {m['steer_mae_deg']:.2f}°  "
+              f"dist {m['dist_mae_m']:.1f}m  "
+              f"flag {m['flag_acc']:.1f}%")
 
-            bs = img_prev.size(0)
-            avg_total.update(loss.item(), bs)
-            avg_curv.update(lc, bs)
-            avg_dist.update(ld, bs)
-            avg_flag.update(lf, bs)
-            global_step += 1
+        if m["total"] < best:
+            best = m["total"]
+            torch.save(model.state_dict(), ckpt_best)
+            print(f"  ★ best → {ckpt_best.name}")
 
-            writer.add_scalar("Loss/train_total",     loss.item(), global_step)
-            writer.add_scalar("Loss/train_curvature", lc,          global_step)
-            writer.add_scalar("Loss/train_distance",  ld,          global_step)
-            writer.add_scalar("Loss/train_flag",      lf,          global_step)
+        pt2e_utils.move_exported_model_to_train(model)
 
-            p_bar.set_postfix(
-                loss=f"{avg_total.avg:.4f}",
-                c=f"{avg_curv.avg:.4f}",
-                d=f"{avg_dist.avg:.4f}",
-                f=f"{avg_flag.avg:.4f}",
-                lr=f"{new_lr:.1e}",
-            )
+    # ── final INT8 conversion ────────────────────────────────────────────
+    print(f"\n{'='*60}\n  Converting best checkpoint to INT8 …")
+    model.load_state_dict(torch.load(ckpt_best, weights_only=True))
+    int8 = convert_pt2e(copy.deepcopy(model).cpu())
+    pt2e_utils.move_exported_model_to_eval(int8)
+    torch.save(int8.state_dict(), ckpt_conv)
+    print(f"  Saved → {ckpt_conv.name}")
 
-        # Epoch-averaged train losses
-        writer.add_scalar("Loss/train_avg_total",     avg_total.avg, epoch + 1)
-        writer.add_scalar("Loss/train_avg_curvature", avg_curv.avg,  epoch + 1)
-        writer.add_scalar("Loss/train_avg_distance",  avg_dist.avg,  epoch + 1)
-        writer.add_scalar("Loss/train_avg_flag",      avg_flag.avg,  epoch + 1)
+    m_int8 = _val(int8.to(dev), val_loader, l1, bce, dev, label="INT8")
+    print(f"  [INT8 val]  loss {m_int8['total']:.4f}  "
+          f"steer {m_int8['steer_mae_deg']:.2f}°  "
+          f"dist {m_int8['dist_mae_m']:.1f}m  "
+          f"flag {m_int8['flag_acc']:.1f}%")
 
-        # ── Save QAT prepared checkpoint (this epoch + rolling last) ──
-        ep_prepared_path = epoch_dir / f"AutoDrive_qat_ep{epoch+1:03d}.pth"
-        torch.save(prepared_model.state_dict(), ep_prepared_path)
-        torch.save(prepared_model.state_dict(), ckpt_last)
-        print(f"\n  Saved QAT prepared  → {ep_prepared_path.name}")
-
-        # ── Validate QAT-prepared model (fake-quantize, float) ────────
-        # We validate the PREPARED model, NOT an INT8-converted copy.
-        # convert_pt2e is called only ONCE at the end, on the best checkpoint.
-        print("  Validating …")
-        pt2e_utils.move_exported_model_to_eval(prepared_model)
-        m = _run_val(prepared_model, val_loader, l1, bce, device, label="val")
-        _tb_val(writer, m, epoch + 1)
-
-        # ── Console summary ───────────────────────────────────────────
-        print(
-            f"\n  ┌{'─'*46}┐\n"
-            f"  │  Epoch {epoch+1:>3d} — QAT-prepared validation    │\n"
-            f"  ├{'─'*46}┤\n"
-            f"  │  {'Val loss (total)':<28} {m['total']:>8.4f}     │\n"
-            f"  │  {'Curvature loss':<28} {m['curv']:>8.4f}     │\n"
-            f"  │  {'Distance loss':<28} {m['dist']:>8.4f}     │\n"
-            f"  │  {'Flag loss':<28} {m['flag']:>8.4f}     │\n"
-            f"  │  {'Steering MAE (deg)':<28} {m['steer_mae_deg']:>8.2f}     │\n"
-            f"  │  {'Distance MAE (m)':<28} {m['dist_mae_m']:>8.2f}     │\n"
-            f"  │  {'CIPO flag acc (%)':<28} {m['flag_acc']:>8.2f}     │\n"
-            f"  └{'─'*46}┘"
-        )
-
-        # ── Best checkpoint tracking ──────────────────────────────────
-        if m["total"] < best_val_loss:
-            best_val_loss = m["total"]
-            torch.save(prepared_model.state_dict(), ckpt_best_prepared)
-            print(f"  ★ New best QAT val loss: {best_val_loss:.4f} "
-                  f"→ {ckpt_best_prepared.name}")
-
-        writer.flush()
-
-        # Return to train mode for the next epoch
-        pt2e_utils.move_exported_model_to_train(prepared_model)
-
-    # ─────────────────────────────────────────────────────────────────────
-    # Final INT8 conversion — called ONCE on the best-trained checkpoint
-    # ─────────────────────────────────────────────────────────────────────
-    print(f"\n{'='*64}")
-    print("  Loading best QAT checkpoint for final INT8 conversion …")
-    prepared_model.load_state_dict(torch.load(ckpt_best_prepared, weights_only=True))
-    prepared_model.to(device)
-
-    print("  Converting to INT8 (convert_pt2e) …")
-    final_int8 = convert_pt2e(copy.deepcopy(prepared_model))
-    final_int8.to(device)
-    pt2e_utils.move_exported_model_to_eval(final_int8)
-    torch.save(final_int8.state_dict(), ckpt_final_int8)
-    int8_size_mb = _model_size_mb(final_int8)
-    writer.add_scalar("Info/model_size_int8_MB", int8_size_mb, args.epochs)
-    print(f"  Saved → {ckpt_final_int8.name}")
-
-    # Validate the final INT8 model
-    print("  Validating final INT8 model …")
-    m_int8 = _run_val(final_int8, val_loader, l1, bce, device, label="int8_final")
-    # Log final INT8 results alongside the best prepared epoch for comparison
-    writer.add_scalar("Loss/final_int8_total",         m_int8["total"],         args.epochs)
-    writer.add_scalar("Metrics/final_int8_flag_acc",   m_int8["flag_acc"],      args.epochs)
-    writer.add_scalar("Metrics/final_int8_steer_mae",  m_int8["steer_mae_deg"], args.epochs)
-    writer.add_scalar("Metrics/final_int8_dist_mae_m", m_int8["dist_mae_m"],    args.epochs)
-    writer.flush()
-
-    print(
-        f"\n  ┌{'─'*46}┐\n"
-        f"  │  Final INT8 validation (best prepared ckpt)  │\n"
-        f"  ├{'─'*46}┤\n"
-        f"  │  {'Val loss (total)':<28} {m_int8['total']:>8.4f}     │\n"
-        f"  │  {'Steering MAE (deg)':<28} {m_int8['steer_mae_deg']:>8.2f}     │\n"
-        f"  │  {'Distance MAE (m)':<28} {m_int8['dist_mae_m']:>8.2f}     │\n"
-        f"  │  {'CIPO flag acc (%)':<28} {m_int8['flag_acc']:>8.2f}     │\n"
-        f"  └{'─'*46}┘"
-    )
-    print(f"\n  Float size : {float_size_mb:.1f} MB")
-    print(f"  INT8  size : {int8_size_mb:.1f} MB")
-
-    # ── Optional ONNX export ──────────────────────────────────────────────
+    # ── ONNX export ──────────────────────────────────────────────────────
     if args.export_onnx:
-        onnx_path = ckpt_dir / "AutoDrive_qat_int8.onnx"
-        print(f"\n  Exporting INT8 ONNX → {onnx_path}")
-        # ONNX export must run on CPU
-        final_int8_cpu = final_int8.cpu()
-        img_prev_ex = torch.randn(1, 3, 512, 1024)
-        img_curr_ex = torch.randn(1, 3, 512, 1024)
-        torch.onnx.export(
-            final_int8_cpu,
-            (img_prev_ex, img_curr_ex),
-            str(onnx_path),
-            opset_version=17,
-            input_names=["image_prev", "image_curr"],
-            output_names=["distance", "curvature", "flag_logit"],
-            dynamic_axes={
-                "image_prev":  {0: "batch"},
-                "image_curr":  {0: "batch"},
-                "distance":    {0: "batch"},
-                "curvature":   {0: "batch"},
-                "flag_logit":  {0: "batch"},
-            },
-        )
-        print(f"  Saved ONNX → {onnx_path}")
+        _, int8_onnx_model = _export_onnx(ckpt_best, val_loader, onnx_path)
 
-    writer.flush()
-    writer.close()
-    print(f"\n{'='*64}")
-    print(f"  QAT complete.  Outputs in: {run_dir}")
-    print(f"  Best QAT prepared   : {ckpt_best_prepared.name}")
-    print(f"  Final INT8 converted: {ckpt_final_int8.name}")
-    print(f"{'='*64}\n")
+        if args.benchmark:
+            _benchmark(args.checkpoint, int8_onnx_model, onnx_path, val_loader, dev)
+
+    tb.flush(); tb.close()
+    print(f"\n  Done. Outputs: {run_dir}\n")
 
 
 if __name__ == "__main__":
