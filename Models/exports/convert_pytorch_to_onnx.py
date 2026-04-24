@@ -124,6 +124,22 @@ def main():
                             'flag_logit': {0: 'batch_size'},
                         },
                         external_data=False)
+    elif model_name == 'AutoSteer':
+        # AutoSteer 2.0 returns a 2-tuple (lane_value, height)
+        torch.onnx.export(model,
+                        input_data,
+                        onnx_model_path,
+                        export_params=True,
+                        opset_version=18,
+                        do_constant_folding=True,
+                        input_names=['input'],
+                        output_names=['lane_value', 'height'],
+                        dynamic_axes={
+                            'input': {0: 'batch_size'},
+                            'lane_value': {0: 'batch_size'},
+                            'height': {0: 'batch_size'},
+                        },
+                        external_data=False)
     else:
         torch.onnx.export(model,                                          # model
                         input_data,                                       # model input
