@@ -1,13 +1,11 @@
-add_executable(VisionPilot VisionPilot.cpp)
+add_executable(VisionPilot vision_pilot.cpp)
 
 target_link_libraries(VisionPilot
         PRIVATE
-        can_reader
-        can_writer
-        input_rtsp_stream
-        output_rtsp_stream
-        autodrive
-        autospeed
-        autosteer
+        can_interface
+        v4l2_interface
+        auto_drive
+        auto_speed
+        auto_steer
         visualization
 )

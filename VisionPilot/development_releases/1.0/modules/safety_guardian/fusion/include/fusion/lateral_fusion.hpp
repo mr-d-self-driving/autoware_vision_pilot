@@ -1,0 +1,8 @@
+//
+// Created by atanasko on 1.5.26.
+//
+
+#ifndef VISIONPILOT_LATERAL_FUSION_HPP
+#define VISIONPILOT_LATERAL_FUSION_HPP
+
+#endif //VISIONPILOT_LATERAL_FUSION_HPP

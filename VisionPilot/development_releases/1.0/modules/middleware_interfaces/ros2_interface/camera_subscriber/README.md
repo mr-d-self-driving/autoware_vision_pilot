@@ -1,0 +1,1 @@
+# Camera subscriber module

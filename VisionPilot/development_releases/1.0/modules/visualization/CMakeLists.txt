@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.22.1)
 
 add_library(visualization
         src/visualization.cpp
+        src/visualization_to_rtsp.cpp
 )
 
 target_include_directories(visualization

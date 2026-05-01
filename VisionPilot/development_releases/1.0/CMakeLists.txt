@@ -11,17 +11,27 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
 # Modules
-add_subdirectory(modules/can_reader)
-add_subdirectory(modules/can_writer)
-add_subdirectory(modules/input_rtsp_stream)
-add_subdirectory(modules/output_rtsp_stream)
-add_subdirectory(modules/visualization)
+add_subdirectory(modules/control)
 
-# Inference
-add_subdirectory(modules/inference/trt_engine)
-add_subdirectory(modules/inference/autodrive)
-add_subdirectory(modules/inference/autospeed)
-add_subdirectory(modules/inference/autosteer)
+add_subdirectory(modules/logging)
+
+add_subdirectory(modules/middleware_interfaces/ros2_interface/camera_subscriber)
+add_subdirectory(modules/middleware_interfaces/ros2_interface/control_cmd_publisher)
+add_subdirectory(modules/middleware_interfaces/ros2_interface/vehicle_state_subscriber)
+add_subdirectory(modules/middleware_interfaces/ros2_interface/visualization_publisher)
+
+add_subdirectory(modules/models/engine)
+add_subdirectory(modules/models/auto_drive)
+add_subdirectory(modules/models/auto_speed)
+add_subdirectory(modules/models/auto_steer)
+
+add_subdirectory(modules/safety_guardian/fusion)
+add_subdirectory(modules/safety_guardian/planning)
+
+add_subdirectory(modules/sensing/can_interface)
+add_subdirectory(modules/sensing/v4l2_interface)
+
+add_subdirectory(modules/visualization)
 
 # App
 add_subdirectory(app)
