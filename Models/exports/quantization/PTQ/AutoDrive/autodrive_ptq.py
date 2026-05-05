@@ -29,6 +29,7 @@ Usage
       --checkpoint ~/data/zod/training/autodrive/run002/checkpoints/AutoDrive_best.pth \\
       --out-dir    ~/data/zod/training/autodrive_ptq/ptq001 \\
       --calib-samples 500 \\
+      --batch-size 1 \\
       --val-fraction 0.10
 
   # skip ONNX export:
@@ -591,7 +592,8 @@ def main() -> None:
                    help="Override validation/benchmark limit in batches; 0 uses --val-fraction")
     p.add_argument("--val-fraction",  type=float, default=0.10,
                    help="Validation fraction for benchmarking when --val-batches=0; 0 or >=1 = full val set (default 0.10)")
-    p.add_argument("--batch-size",    type=int, default=16)
+    p.add_argument("--batch-size",    type=int, default=1,
+                   help="Static export batch size. Use 1 for realtime pair inference; pass 16 explicitly for batched benchmarking.")
     p.add_argument("--workers",       type=int, default=4)
     p.add_argument("--ort-provider",  choices=("auto", "cuda", "cpu"), default="auto",
                    help="ONNX Runtime provider for ONNX benchmark (default auto; cuda fails if CUDA EP cannot load)")
