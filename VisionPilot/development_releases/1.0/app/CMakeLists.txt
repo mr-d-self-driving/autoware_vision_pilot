@@ -4,8 +4,6 @@ target_link_libraries(VisionPilot
         PRIVATE
         can_interface
         v4l2_interface
-        auto_drive
-        auto_speed
-        auto_steer
+        models
         visualization
 )
